@@ -1,0 +1,840 @@
+diff --git a/mlx_lm/models/inkling2/kernels.py b/mlx_lm/models/inkling2/kernels.py
+index 6279769..ee9fb66 100644
+--- a/mlx_lm/models/inkling2/kernels.py
++++ b/mlx_lm/models/inkling2/kernels.py
+@@ -5,8 +5,11 @@ import mlx.core as mx
+ from mlx_lm.kernels.common import row_threads, scalar
+ 
+ __all__ = [
++    "decode_relative_mask",
+     "depth_attention",
++    "moe_convolution",
+     "relative_attention",
++    "short_convolution",
+ ]
+ 
+ 
+@@ -320,3 +323,178 @@ def relative_attention(
+         output_shapes=[(B, L, Hq, D)],
+         output_dtypes=[q.dtype],
+     )[0]
++
++
++_DECODE_RELATIVE_MASK_SOURCE = """
++    uint key = thread_position_in_grid.x;
++    uint head = thread_position_in_grid.y;
++    int distance = last_slot - int(key);
++    if (distance < 0) {
++        distance += int(key_count);
++    }
++    T value = T(0);
++    if (WINDOW > 0 && distance >= WINDOW) {
++        value = T(-INFINITY);
++    } else if (distance < R) {
++        value = T(bias[head * R + distance]);
++    }
++    mask[head * key_count + key] = value;
++"""
++
++_decode_relative_mask_kernel = mx.fast.metal_kernel(
++    name="decode_relative_mask",
++    input_names=["bias", "key_count", "last_slot"],
++    output_names=["mask"],
++    source=_DECODE_RELATIVE_MASK_SOURCE,
++)
++
++
++def decode_relative_mask(
++    bias: mx.array, key_count: int, last_slot: int, window: int, dtype: mx.Dtype
++) -> mx.array:
++    heads, extent = bias.shape[-2:]
++    return _decode_relative_mask_kernel(
++        inputs=[bias, mx.array(key_count, mx.uint32), mx.array(last_slot, mx.int32)],
++        template=[("R", extent), ("WINDOW", window), ("T", dtype)],
++        grid=(key_count, heads, 1),
++        threadgroup=(128, 1, 1),
++        output_shapes=[(heads, key_count)],
++        output_dtypes=[dtype],
++    )[0]
++
++
++_SHORT_CONVOLUTION_SOURCE = """
++    uint channel = thread_position_in_grid.x;
++    uint token = thread_position_in_grid.y;
++    uint offset = token * CHANNELS + channel;
++    if (STATE_ONLY) {
++        if (token < 3) {
++            uint source = (length + token) * CHANNELS + channel;
++            window[offset] = length + token < 3 ? previous[source]
++                : float(hidden[source - 3 * CHANNELS]);
++        }
++    } else {
++        window[offset] = token < 3 ? previous[offset] : float(hidden[offset - 3 * CHANNELS]);
++    }
++    if (token >= length) {
++        return;
++    }
++
++    float residual = float(hidden[offset]);
++    float acc = 0.0f;
++    const device bfloat16_t* taps = weight + 4 * channel;
++    for (uint tap = 0; tap < 4; ++tap) {
++        uint slot = offset + tap * CHANNELS;
++        bfloat16_t value = token + tap < 3
++            ? bfloat16_t(previous[slot])
++            : hidden[slot - 3 * CHANNELS];
++        acc = fma(float(value), float(taps[tap]), acc);
++    }
++    // Conv1d rounds to the weight dtype before the residual add.
++    output[offset] = bfloat16_t((float(bfloat16_t(acc)) + residual) / divisor);
++"""
++
++_short_convolution_kernel = mx.fast.metal_kernel(
++    name="inkling2_short_convolution",
++    input_names=["hidden", "previous", "weight", "length", "divisor"],
++    output_names=["output", "window"],
++    source=_SHORT_CONVOLUTION_SOURCE,
++)
++
++
++def short_convolution(
++    hidden: mx.array, previous: mx.array, weight: mx.array, *, state_only: bool = False
++) -> tuple[mx.array, mx.array]:
++    """Four-tap BF16 convolution and its FP32 window or trailing state."""
++    _, length, channels = hidden.shape
++    out, window = _short_convolution_kernel(
++        inputs=[
++            hidden, previous, weight, mx.array(length, mx.uint32), mx.array(5**0.5, mx.float32)
++        ],
++        template=[("CHANNELS", channels), ("STATE_ONLY", state_only)],
++        grid=(channels, max(length, 3) if state_only else length + 3, 1),
++        threadgroup=(128, 1, 1),
++        output_shapes=[hidden.shape, (1, 3 if state_only else length + 3, channels)],
++        output_dtypes=[mx.bfloat16, mx.float32],
++    )
++    return out, window
++
++
++_MOE_CONVOLUTION_SOURCE = """
++    #pragma clang fp contract(off)
++    uint channel = thread_position_in_grid.x;
++    // Match the FP32 products and sum, then round before convolution.
++    float combined = 0.0f;
++    for (uint expert = 0; expert < EXPERTS; ++expert) {
++        combined += float(experts[expert * CHANNELS + channel]) * routing[expert];
++    }
++    bfloat16_t hidden = bfloat16_t(combined);
++    const device bfloat16_t* taps = weight + 4 * channel;
++    float acc = 0.0f;
++    for (uint tap = 0; tap < 3; ++tap) {
++        uint slot = tap * CHANNELS + channel;
++        float sample = previous[slot];
++        window[slot] = sample;
++        acc = fma(float(bfloat16_t(sample)), float(taps[tap]), acc);
++    }
++    window[3 * CHANNELS + channel] = float(hidden);
++    acc = fma(float(hidden), float(taps[3]), acc);
++    bfloat16_t convolved = bfloat16_t(
++        (float(bfloat16_t(acc)) + float(hidden)) / divisor
++    );
++    output[channel] = bfloat16_t(residual[channel] + float(convolved));
++"""
++
++_moe_convolution_kernel = mx.fast.metal_kernel(
++    name="inkling2_moe_convolution",
++    input_names=["experts", "routing", "previous", "weight", "residual", "divisor"],
++    output_names=["output", "window"],
++    source=_MOE_CONVOLUTION_SOURCE,
++)
++
++
++def moe_convolution(experts, routing, previous, weight, residual):
++    channels = residual.shape[-1]
++    output, window = _moe_convolution_kernel(
++        inputs=[experts, routing, previous, weight, residual, scalar(5**0.5)],
++        template=[("CHANNELS", channels), ("EXPERTS", experts.shape[-2])],
++        grid=(channels, 1, 1),
++        threadgroup=(128, 1, 1),
++        output_shapes=[residual.shape, (1, 4, channels)],
++        output_dtypes=[mx.bfloat16, mx.float32],
++    )
++    return output, window
++
++
++_SORTED_EXPERT_REDUCE_SOURCE = """
++    #pragma clang fp contract(off)
++    uint channel = thread_position_in_grid.x;
++    uint token = thread_position_in_grid.y;
++    uint base = token * TOP_K;
++    float combined = 0.0f;
++    for (uint expert = 0; expert < TOP_K; ++expert) {
++        uint slot = base + expert;
++        combined += float(experts[inverse[slot] * CHANNELS + channel]) * routing[slot];
++    }
++    output[token * CHANNELS + channel] = combined;
++"""
++
++_sorted_expert_reduce_kernel = mx.fast.metal_kernel(
++    name="inkling2_sorted_expert_reduce",
++    input_names=["experts", "inverse", "routing"],
++    output_names=["output"],
++    source=_SORTED_EXPERT_REDUCE_SOURCE,
++)
++
++
++def sorted_expert_reduce(experts, inverse, routing):
++    """Reduce sorted expert rows in their original top-k order."""
++    channels, top_k = experts.shape[-1], routing.shape[-1]
++    return _sorted_expert_reduce_kernel(
++        inputs=[experts, inverse, routing],
++        template=[("CHANNELS", channels), ("TOP_K", top_k)],
++        grid=(channels, routing.size // top_k, 1),
++        threadgroup=(128, 1, 1),
++        output_shapes=[routing.shape[:-1] + (channels,)],
++        output_dtypes=[mx.float32],
++    )[0]
+diff --git a/mlx_lm/models/inkling2/layers.py b/mlx_lm/models/inkling2/layers.py
+index 66816c4..3c03926 100644
+--- a/mlx_lm/models/inkling2/layers.py
++++ b/mlx_lm/models/inkling2/layers.py
+@@ -1,6 +1,7 @@
+ # Copyright © 2026 Apple Inc.
+ 
+ import math
++import weakref
+ from functools import partial
+ from typing import Any
+ 
+@@ -10,9 +11,16 @@ from mlx.nn.layers.distributed import sum_gradients
+ 
+ from mlx_lm.kernels.expert_routing import expert_routing
+ from mlx_lm.layers.moe import SwitchLinear, _gather_sort, _scatter_unsort
+-from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
++from mlx_lm.models.cache import BatchRotatingKVCache, KVCache, RotatingKVCache
+ from mlx_lm.models.inkling2.config import TextArgs
+-from mlx_lm.models.inkling2.kernels import depth_attention, relative_attention
++from mlx_lm.models.inkling2.kernels import (
++    decode_relative_mask,
++    depth_attention,
++    moe_convolution,
++    relative_attention,
++    short_convolution,
++    sorted_expert_reduce,
++)
+ 
+ __all__ = [
+     "Attention",
+@@ -112,7 +120,11 @@ def _conv_input(
+ 
+ def _conv_state(window: mx.array, lengths: mx.array | None, n: int) -> mx.array:
+     if lengths is None:
+-        pos = mx.arange(window.shape[1] - n, window.shape[1])[None, :, None]
++        start = window.shape[1] - n
++        if start in (0, 1):
++            # A compact state or a view retaining at most one extra token.
++            return window[:, start:]
++        pos = mx.arange(start, window.shape[1])[None, :, None]
+     else:
+         ends = mx.clip(lengths, 0, window.shape[1] - n)
+         pos = (ends[:, None] + mx.arange(n))[..., None]
+@@ -131,8 +143,29 @@ class ShortConvolution(nn.Module):
+         hidden_states: mx.array,
+         conv_state: mx.array | None,
+         conv_mask: mx.array | None,
++        *,
++        compact_state: bool = False,
+     ) -> tuple[mx.array, mx.array]:
+         K = self.kernel_size
++        weight = self.conv1d.weight
++        if (
++            K == 4
++            and hidden_states.shape[0] == 1
++            and conv_mask is None
++            and hidden_states.dtype == weight.dtype == mx.bfloat16
++            and not self.training
++            and _use_kernels()
++        ):
++            state_shape = (1, K - 1, hidden_states.shape[-1])
++            if conv_state is None:
++                conv_state = mx.zeros(state_shape, mx.float32)
++            if conv_state.shape == state_shape and conv_state.dtype == mx.float32:
++                return short_convolution(
++                    hidden_states,
++                    conv_state,
++                    weight,
++                    state_only=compact_state and hidden_states.shape[1] > 1,
++                )
+         residual = hidden_states.astype(mx.float32)
+         window = _conv_input(hidden_states, conv_state, conv_mask, K)
+         # As the reference, the conv runs in the weight dtype.
+@@ -266,16 +299,15 @@ class Attention(nn.Module):
+         )
+         self.eps = args.rms_norm_eps
+ 
+-    def _attend(
++    def _project(
+         self,
+         hidden_states: mx.array,
+         query_states: mx.array,
+         key_states: mx.array,
+         value_states: mx.array,
+         relative_states: mx.array,
+-        cache: Any | None,
+         tau: mx.array | None = None,
+-    ) -> mx.array:
++    ) -> tuple:
+         B, L, _ = hidden_states.shape
+         gate = self.gate_proj(hidden_states)
+         sinks = self.sink_proj(hidden_states)
+@@ -302,16 +334,43 @@ class Attention(nn.Module):
+         query_states = query_states.transpose(0, 2, 1, 3)
+         key_states = key_states.transpose(0, 2, 1, 3)
+         value_states = value_states.transpose(0, 2, 1, 3)
++        return query_states, key_states, value_states, position_bias, sinks, gate
++
++    def attend(self, query, key, value, position_bias, sinks, cache):
+         if cache is not None:
+-            key_states, value_states = cache.update_and_fetch(key_states, value_states)
+-        attn_output = self._attention(
+-            query_states, key_states, value_states, position_bias, sinks, cache
+-        )
++            key, value = cache.update_and_fetch(key, value)
++        return self._attention(query, key, value, position_bias, sinks, cache)
+ 
+-        attn_output = attn_output.reshape(B, L, -1).astype(mx.float32)
++    def project_output(self, attn_output, gate):
++        attn_output = attn_output.reshape(gate.shape).astype(mx.float32)
+         attn_output = attn_output * mx.sigmoid(gate.astype(mx.float32))
+         return self.o_proj(attn_output.astype(gate.dtype))
+ 
++    def __call__(
++        self,
++        hidden_states: mx.array,
++        key_hidden_states: mx.array,
++        value_hidden_states: mx.array,
++        *,
++        cache: Any | None,
++        conv_states: list,
++        conv_mask: mx.array | None,
++    ) -> mx.array:
++        kv_cache = cache[0] if cache is not None else None
++        query, key, value, bias, sinks, gate = self.project(
++            hidden_states,
++            key_hidden_states,
++            value_hidden_states,
++            conv_states,
++            conv_mask,
++            self.tau(kv_cache, hidden_states.shape[1]),
++        )
++        attn = self.attend(query, key, value, bias, sinks, kv_cache)
++        return self.project_output(attn, gate)
++
++    def tau(self, cache, length):
++        return None
++
+     def _attention(self, query, key, value, position_bias, sinks, cache) -> mx.array:
+         B, _, L, _ = query.shape
+         S = key.shape[2]
+@@ -330,18 +389,30 @@ class Attention(nn.Module):
+                 key_start=key_start,
+             )
+ 
+-        query_positions = _positions(end - L, L)
+-        key_positions = _key_positions(cache, S, L, end)
+         if L == 1 and B == 1:
+-            # The fused attention takes the sinks of one row.
+-            distance = query_positions.reshape(1) - key_positions.reshape(S)
+-            R = position_bias.shape[-1]
+-            bias = mx.take(position_bias[0, 0], mx.clip(distance, 0, R - 1), axis=-1)
+-            bias = mx.where(distance < R, bias, mx.zeros_like(bias))
+-            visible = (distance >= 0) & (key_positions.reshape(S) >= 0)
+-            if self.sliding_window:
+-                visible = visible & (distance < self.sliding_window)
+-            mask = mx.where(visible, bias, -mx.inf).astype(query.dtype)
++            # Plain caches have no padding. The latest physical slot is
++            # enough to map every key to its relative distance.
++            if (
++                not self.training
++                and _use_kernels()
++                and (cache is None or type(cache) in (KVCache, RotatingKVCache))
++                and end >= S
++            ):
++                last_slot = cache._idx - 1 if type(cache) is RotatingKVCache else S - 1
++                mask = decode_relative_mask(
++                    position_bias, S, last_slot, self.sliding_window, query.dtype
++                )
++            else:
++                query_positions = _positions(end - L, L)
++                key_positions = _key_positions(cache, S, L, end)
++                distance = query_positions.reshape(1) - key_positions.reshape(S)
++                R = position_bias.shape[-1]
++                bias = mx.take(position_bias[0, 0], mx.clip(distance, 0, R - 1), axis=-1)
++                bias = mx.where(distance < R, bias, mx.zeros_like(bias))
++                visible = (distance >= 0) & (key_positions.reshape(S) >= 0)
++                if self.sliding_window:
++                    visible = visible & (distance < self.sliding_window)
++                mask = mx.where(visible, bias, -mx.inf).astype(query.dtype)
+             attn_output = mx.fast.scaled_dot_product_attention(
+                 query,
+                 key,
+@@ -352,6 +423,8 @@ class Attention(nn.Module):
+             )
+             return attn_output.transpose(0, 2, 1, 3)
+ 
++        query_positions = _positions(end - L, L)
++        key_positions = _key_positions(cache, S, L, end)
+         return _attention_reference(
+             query,
+             key,
+@@ -372,30 +445,27 @@ class SlidingAttention(Attention):
+         self.k_sconv = ShortConvolution(dims, args.sconv_kernel_size)
+         self.v_sconv = ShortConvolution(dims, args.sconv_kernel_size)
+ 
+-    def __call__(
++    def project(
+         self,
+         hidden_states: mx.array,
+         key_hidden_states: mx.array,
+         value_hidden_states: mx.array,
+-        *,
+-        cache: Any | None,
+         conv_states: list,
+         conv_mask: mx.array | None,
+-    ) -> mx.array:
+-        kv_cache = cache[0] if cache is not None else None
++        tau: mx.array | None,
++    ) -> tuple:
+         key_states, conv_states[0] = self.k_sconv(
+-            self.k_proj(key_hidden_states), conv_states[0], conv_mask
++            self.k_proj(key_hidden_states), conv_states[0], conv_mask, compact_state=True
+         )
+         value_states, conv_states[1] = self.v_sconv(
+-            self.v_proj(value_hidden_states), conv_states[1], conv_mask
++            self.v_proj(value_hidden_states), conv_states[1], conv_mask, compact_state=True
+         )
+-        return self._attend(
++        return self._project(
+             hidden_states,
+             self.q_proj(hidden_states),
+             key_states,
+             value_states,
+             self.r_proj(hidden_states),
+-            kv_cache,
+         )
+ 
+ 
+@@ -409,17 +479,15 @@ class FullAttention(Attention):
+         self.log_scaling_n_floor = args.log_scaling_n_floor
+         self.log_scaling_alpha = args.log_scaling_alpha
+ 
+-    def __call__(
++    def project(
+         self,
+         hidden_states: mx.array,
+         key_hidden_states: mx.array,
+         value_hidden_states: mx.array,
+-        *,
+-        cache: Any | None,
+         conv_states: list,
+         conv_mask: mx.array | None,
+-    ) -> mx.array:
+-        kv_cache = cache[0] if cache is not None else None
++        tau: mx.array | None,
++    ) -> tuple:
+         key_states, conv_states[0] = self.k_sconv(
+             self.k_proj(key_hidden_states),
+             key_hidden_states,
+@@ -433,21 +501,23 @@ class FullAttention(Attention):
+             conv_mask,
+         )
+ 
+-        offset = kv_cache.offset if kv_cache is not None else 0
+-        position_ids = _positions(offset, hidden_states.shape[1]).astype(mx.float32)
+-        tau = 1.0 + self.log_scaling_alpha * mx.log(
+-            mx.maximum((position_ids + 1) / self.log_scaling_n_floor, 1.0)
+-        )
+-        return self._attend(
++        return self._project(
+             hidden_states,
+             self.q_proj(hidden_states),
+             key_states,
+             value_states,
+             self.r_proj(hidden_states),
+-            kv_cache,
+-            tau=tau[..., None, None],
++            tau=tau,
+         )
+ 
++    def tau(self, cache, length):
++        offset = cache.offset if cache is not None else 0
++        position_ids = _positions(offset, length).astype(mx.float32)
++        tau = 1.0 + self.log_scaling_alpha * mx.log(
++            mx.maximum((position_ids + 1) / self.log_scaling_n_floor, 1.0)
++        )
++        return tau[..., None, None]
++
+ 
+ class SoftcappedSwiGLU(nn.Module):
+     def __init__(self, args: TextArgs):
+@@ -469,7 +539,9 @@ class Experts(nn.Module):
+         self.down_proj = SwitchLinear(hidden, dims, num_experts, bias=False)
+         self.act_fn = SoftcappedSwiGLU(args)
+ 
+-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
++    def __call__(
++        self, x: mx.array, indices: mx.array, routing_weights: mx.array | None = None
++    ) -> mx.array:
+         x = mx.expand_dims(x, (-2, -3))
+         indices = mx.stop_gradient(indices)
+         do_sort = indices.size >= 64
+@@ -480,6 +552,8 @@ class Experts(nn.Module):
+         x = self.act_fn(gate_up[..., 0::2], gate_up[..., 1::2])
+         x = self.down_proj(x, idx, sorted_indices=do_sort)
+         if do_sort:
++            if routing_weights is not None:
++                return sorted_expert_reduce(x, inv_order, routing_weights)
+             x = _scatter_unsort(x, inv_order, indices.shape)
+         return x.squeeze(-2)
+ 
+@@ -520,20 +594,42 @@ class SparseMoeBlock(nn.Module):
+         self.experts = Experts(args)
+         self.sharding_group = None
+ 
++    def _routed_experts(self, hidden_states):
++        selected_experts, routing_weights = self.gate(hidden_states)
++        return self.experts(hidden_states, selected_experts), routing_weights
++
+     def __call__(self, hidden_states: mx.array) -> mx.array:
+         group = self.sharding_group
+         if group is not None:
+             hidden_states = sum_gradients(group)(hidden_states)
+-        selected_experts, routing_weights = self.gate(hidden_states)
+-        expert_states = self.experts(hidden_states, selected_experts)
+-        expert_states = expert_states.astype(mx.float32) * routing_weights[..., None]
+-        final_hidden_states = expert_states.sum(axis=-2)
++        if (
++            hidden_states.ndim == 3
++            and hidden_states.shape[0] == 1
++            and hidden_states.shape[1] >= 8
++            and hidden_states.dtype == mx.bfloat16
++            and group is None
++            and self.gate.top_k == 8
++            and not self.training
++            and _use_kernels()
++        ):
++            selected_experts, routing_weights = self.gate(hidden_states)
++            final_hidden_states = self.experts(
++                hidden_states, selected_experts, routing_weights
++            )
++        else:
++            expert_states, routing_weights = self._routed_experts(hidden_states)
++            final_hidden_states = self._combine_experts(expert_states, routing_weights)
+         if group is not None:
+             final_hidden_states = mx.distributed.all_sum(
+                 final_hidden_states, group=group
+             )
+         return final_hidden_states.astype(hidden_states.dtype)
+ 
++    @staticmethod
++    def _combine_experts(expert_states, routing_weights):
++        weighted = expert_states.astype(mx.float32) * routing_weights[..., None]
++        return weighted.sum(axis=-2)
++
+ 
+ class BlockAttentionResidual(nn.Module):
+     def __init__(self, dims: int, num_queries: int = 1):
+@@ -602,6 +698,7 @@ class DecoderLayer(nn.Module):
+         )
+         self.mlp_input = BlockAttentionResidual(dims)
+         self.mlp = SparseMoeBlock(args)
++        self._compiled_inference = None
+         self.post_attention_layernorm = nn.RMSNorm(dims, eps=args.rms_norm_eps)
+         kernel_size = args.sconv_kernel_size
+         self.post_attention_convolution = ShortConvolution(dims, kernel_size)
+@@ -621,29 +718,36 @@ class DecoderLayer(nn.Module):
+             self.v_message_gate(v_states, messages[..., 2, :]),
+         )
+ 
+-    def __call__(
+-        self,
+-        hidden_states: mx.array,
+-        block_states: mx.array | None,
+-        *,
+-        cache: Any | None = None,
+-        conv_mask: mx.array | None = None,
+-        messages: mx.array | None = None,
+-    ) -> tuple[mx.array, mx.array]:
+-        dtype = hidden_states.dtype
+-        conv = cache[1] if cache is not None else None
+-        conv_states = list(conv.cache) if conv is not None else [None] * 4
+-        block_residual = hidden_states
+-        normed_residual = unweighted_rms_norm(block_residual.astype(mx.float32))
+-
+-        attention_inputs = None
+-        if self.attention_input is not None:
+-            attention_inputs = self.attention_input(block_states, normed_residual)
+-        hidden_states = self._self_attention(
+-            hidden_states, attention_inputs, cache, conv_states, conv_mask, messages
++    def _prepare(self, hidden_states, block_states, states, conv_mask, messages, tau):
++        normed_residual = unweighted_rms_norm(hidden_states.astype(mx.float32))
++        attention_inputs = (
++            self.attention_input(block_states, normed_residual)
++            if self.attention_input is not None
++            else None
++        )
++        attention_states = self._attention_inputs(
++            hidden_states, attention_inputs, messages
+         )
+-        hidden_states, conv_states[2] = self.post_attention_convolution(
+-            hidden_states, conv_states[2], conv_mask
++        windows = list(states)
++        projected = self.self_attn.project(*attention_states, windows, conv_mask, tau)
++        return projected, windows, normed_residual
++
++    def _finish(
++        self,
++        attn,
++        gate,
++        block_residual,
++        block_states,
++        normed_residual,
++        states,
++        conv_mask,
++        messages,
++    ):
++        dtype = block_residual.dtype
++        conv_states = list(states)
++        hidden_states = self.self_attn.project_output(attn, gate)
++        hidden_states, conv_states[0] = self.post_attention_convolution(
++            hidden_states, conv_states[0], conv_mask, compact_state=True
+         )
+ 
+         residual = hidden_states = hidden_states.astype(mx.float32)
+@@ -660,20 +764,107 @@ class DecoderLayer(nn.Module):
+         hidden_states = self.mlp_input(block_states, normed_states)[..., 0, :]
+         if messages is not None:
+             hidden_states = self.mlp_message_gate(hidden_states, messages[..., 3, :])
+-        hidden_states = self.mlp(
+-            self.post_attention_layernorm(hidden_states).astype(dtype)
+-        )
+-        hidden_states, conv_states[3] = self.post_mlp_convolution(
+-            hidden_states, conv_states[3], conv_mask
++        hidden_states = self.post_attention_layernorm(hidden_states).astype(dtype)
++        convolution = self.post_mlp_convolution
++        weight = convolution.conv1d.weight
++        previous = conv_states[1]
++        state_shape = (1, 3, hidden_states.shape[-1])
++        if (
++            hidden_states.shape[:2] == (1, 1)
++            and dtype == weight.dtype == mx.bfloat16
++            and convolution.kernel_size == 4
++            and self.mlp.gate.top_k == 8
++            and conv_mask is None
++            and not self.training
++            and self.mlp.sharding_group is None
++            and _use_kernels()
++            and (
++                previous is None
++                or (previous.shape == state_shape and previous.dtype == mx.float32)
++            )
++        ):
++            if previous is None:
++                previous = mx.zeros(state_shape, mx.float32)
++            expert_states, routing = self.mlp._routed_experts(hidden_states)
++            if expert_states.dtype == mx.bfloat16 and routing.dtype == mx.float32:
++                hidden_states, conv_states[1] = moe_convolution(
++                    expert_states, routing, previous, weight, residual
++                )
++                return hidden_states, block_states, conv_states
++            hidden_states = self.mlp._combine_experts(expert_states, routing).astype(dtype)
++        else:
++            hidden_states = self.mlp(hidden_states)
++        hidden_states, conv_states[1] = convolution(
++            hidden_states, previous, conv_mask, compact_state=True
+         )
++        hidden_states = residual + hidden_states.astype(mx.float32)
++        return hidden_states.astype(dtype), block_states, conv_states
+ 
++    def _inference_stages(self):
++        if self._compiled_inference is None:
++            # Capture parameter references so a compiled stage sees updated
++            # weights. Keep the callbacks from owning the layer itself.
++            layer = weakref.proxy(self)
++            params = {}
++
++            @partial(mx.compile, inputs=params)
++            def prepare(*args):
++                return DecoderLayer._prepare(layer, *args)
++
++            @partial(mx.compile, inputs=params)
++            def finish(*args):
++                return DecoderLayer._finish(layer, *args)
++
++            # Store the compilation cache outside the nn.Module parameter tree.
++            object.__setattr__(self, "_compiled_inference", (prepare, finish, params))
++        prepare, finish, params = self._compiled_inference
++        params.update(self)
++        return prepare, finish
++
++    def __call__(
++        self,
++        hidden_states: mx.array,
++        block_states: mx.array | None,
++        *,
++        cache: Any | None = None,
++        conv_mask: mx.array | None = None,
++        messages: mx.array | None = None,
++    ) -> tuple[mx.array, mx.array]:
++        kv_cache, conv = cache if cache is not None else (None, None)
++        states = conv.cache if conv is not None else [None] * 4
++        tau = self.self_attn.tau(kv_cache, hidden_states.shape[1])
++        if (
++            hidden_states.shape[0] == 1
++            # Reuse the compiled stages for decode and full prefill chunks.
++            and hidden_states.shape[1] in (1, 512)
++            and not self.training
++            and self.mlp.sharding_group is None
++            and _use_kernels()
++        ):
++            prepare, finish = self._inference_stages()
++        else:
++            prepare, finish = self._prepare, self._finish
++        projected, windows, normed_residual = prepare(
++            hidden_states, block_states, states[:2], conv_mask, messages, tau
++        )
++        query, key, value, bias, sinks, gate = projected
++        attn = self.self_attn.attend(query, key, value, bias, sinks, kv_cache)
++        hidden_states, block_states, post_windows = finish(
++            attn,
++            gate,
++            hidden_states,
++            block_states,
++            normed_residual,
++            states[2:],
++            conv_mask,
++            messages,
++        )
+         if conv is not None:
+             n = self.post_mlp_convolution.kernel_size - 1
+-            for i, window in enumerate(conv_states):
++            for i, window in enumerate(windows + post_windows):
+                 conv[i] = _conv_state(window, conv.lengths, n)
+-            conv.advance(block_residual.shape[1])
+-        hidden_states = residual + hidden_states.astype(mx.float32)
+-        return hidden_states.astype(dtype), block_states
++            conv.advance(hidden_states.shape[1])
++        return hidden_states, block_states
+ 
+ 
+ class SlidingDecoderLayer(DecoderLayer):
+@@ -682,9 +873,7 @@ class SlidingDecoderLayer(DecoderLayer):
+         self.self_attn = SlidingAttention(args)
+         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+ 
+-    def _self_attention(
+-        self, hidden_states, attention_inputs, cache, conv_states, conv_mask, messages
+-    ):
++    def _attention_inputs(self, hidden_states, attention_inputs, messages):
+         dtype = hidden_states.dtype
+         if attention_inputs is not None:
+             hidden_states = attention_inputs[..., 0, :]
+@@ -693,12 +882,7 @@ class SlidingDecoderLayer(DecoderLayer):
+         else:
+             states = self._mix_messages((hidden_states,) * 3, messages)
+             states = [self.input_layernorm(s).astype(dtype) for s in states]
+-        return self.self_attn(
+-            *states,
+-            cache=cache,
+-            conv_states=conv_states,
+-            conv_mask=conv_mask,
+-        )
++        return states
+ 
+ 
+ class FullDecoderLayer(DecoderLayer):
+@@ -710,9 +894,7 @@ class FullDecoderLayer(DecoderLayer):
+         self.k_input_layernorm = nn.RMSNorm(args.hidden_size, eps=eps)
+         self.v_input_layernorm = nn.RMSNorm(args.hidden_size, eps=eps)
+ 
+-    def _self_attention(
+-        self, hidden_states, attention_inputs, cache, conv_states, conv_mask, messages
+-    ):
++    def _attention_inputs(self, hidden_states, attention_inputs, messages):
+         dtype = hidden_states.dtype
+         if attention_inputs is None:
+             query_states = key_states = value_states = hidden_states
+@@ -724,11 +906,8 @@ class FullDecoderLayer(DecoderLayer):
+             query_states, key_states, value_states = self._mix_messages(
+                 (query_states, key_states, value_states), messages
+             )
+-        return self.self_attn(
++        return (
+             self.q_input_layernorm(query_states).astype(dtype),
+             self.k_input_layernorm(key_states).astype(dtype),
+             self.v_input_layernorm(value_states).astype(dtype),
+-            cache=cache,
+-            conv_states=conv_states,
+-            conv_mask=conv_mask,
+         )
+diff --git a/mlx_lm/models/inkling2/model.py b/mlx_lm/models/inkling2/model.py
+index f860c2c..469de64 100644
+--- a/mlx_lm/models/inkling2/model.py
++++ b/mlx_lm/models/inkling2/model.py
+@@ -18,6 +18,7 @@ from mlx_lm.models.inkling2.layers import (
+     MessageInput,
+     ShortConvolution,
+     SlidingDecoderLayer,
++    _use_kernels,
+     unweighted_rms_norm,
+ )
+ from mlx_lm.models.inkling2.vision import VisionModel
+@@ -74,17 +75,48 @@ class TextModel(PipelineMixin, nn.Module):
+     def _run_loop(self, hidden_states, cache, conv_mask):
+         core = self.args.loop_core
+         caches = iter(cache)
++        stage_prefill = (
++            hidden_states.shape[0] == 1
++            and hidden_states.shape[1] > 1
++            and cache[0] is not None
++            and type(cache[0][0]) in (KVCache, RotatingKVCache)
++            and conv_mask is None
++            and hidden_states.dtype == mx.bfloat16
++            and not self.training
++            and self.layers[0].mlp.sharding_group is None
++            and _use_kernels()
++        )
++        pending = []
+ 
+         def run(layers, hidden_states, block_states, bank=None):
++            nonlocal stage_prefill
+             for i, layer in enumerate(layers):
+                 messages = None if bank is None else self.message_input(bank, i)
++                visit_cache = next(caches)
+                 hidden_states, block_states = layer(
+                     hidden_states,
+                     block_states,
+-                    cache=next(caches),
++                    cache=visit_cache,
+                     conv_mask=conv_mask,
+                     messages=messages,
+                 )
++                if stage_prefill:
++                    pending.append(visit_cache)
++                    if type(visit_cache[0]) is KVCache:
++                        # Submit this group's KV and convolution updates before
++                        # building the graph for the next group of visits.
++                        try:
++                            mx.async_eval(
++                                hidden_states, block_states, [c.state for c in pending]
++                            )
++                        except ValueError as error:
++                            # An outer mx.compile or grad needs the lazy graph.
++                            if str(error) != (
++                                "[async_eval] Not allowed inside a graph transformation."
++                            ):
++                                raise
++                            stage_prefill = False
++                        pending.clear()
+             return hidden_states, block_states
+ 
+         prelude = run(self.layers[: core.start], hidden_states, None)

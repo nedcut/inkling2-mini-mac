@@ -1,0 +1,4 @@
+{"label": "package", "ctx": 510, "ttft_s": 1.34, "prompt_tps": 380.5, "gen_tokens": 256, "gen_tps": 44.35, "run": 0}
+{"label": "package", "ctx": 510, "ttft_s": 1.35, "prompt_tps": 377.7, "gen_tokens": 256, "gen_tps": 44.49, "run": 1}
+{"label": "package", "ctx": 3912, "ttft_s": 9.69, "prompt_tps": 403.9, "gen_tokens": 256, "gen_tps": 42.51, "run": 0}
+{"label": "package", "ctx": 3912, "ttft_s": 1.02, "prompt_tps": 3849.9, "gen_tokens": 256, "gen_tps": 42.73, "run": 1}

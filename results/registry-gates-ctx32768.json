@@ -1,0 +1,66 @@
+{
+  "passed": true,
+  "proof": {
+    "gates": "load chat reasoning tools context speed",
+    "tps": 40.6,
+    "prefill": 298,
+    "served": "inkling-2-mini"
+  },
+  "evidence": {
+    "ok": {
+      "load": true,
+      "chat": true,
+      "reasoning": true,
+      "tools": true,
+      "context": true,
+      "speed": true
+    },
+    "spec": null,
+    "chat": {
+      "content": "red, yellow, blue",
+      "finish": "stop"
+    },
+    "reasoning": {
+      "thinking_chars": 124,
+      "content": "391"
+    },
+    "tools": {
+      "call": [
+        {
+          "id": "call_3abadf7bf3644b7e8eef41d5",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Paris\"}"
+          }
+        }
+      ],
+      "reply": "Right now in Paris: 17\u00b0C, overcast. The code the tool returned is `04a95e2f`.",
+      "code": "04a95e2f",
+      "finish": "stop",
+      "calls_again": 0,
+      "thinking_chars": 751
+    },
+    "context": {
+      "prompt_tokens": 22250,
+      "seconds": 74.6,
+      "content": "58213",
+      "peak_gib": 17.94
+    },
+    "speed": {
+      "window_s": 30.0,
+      "tokens_in_window": 1218,
+      "tokens_total": 1465,
+      "seconds_total": 37.2,
+      "counted": "tokenizer",
+      "accounting": "client tokens over the first 30 s after the first token; speculative drafts are not counted as accepted"
+    },
+    "prefill": {
+      "value": 298,
+      "source": "context gate: prompt tokens / the whole request's seconds (queue + prefill + the short answer), cold unique filler"
+    }
+  },
+  "ctx": 32768,
+  "lab_sha256": "67747d3954613768a64c7a5c2afb02cd6d050e1745ff4cb39dfa672d37f0cade",
+  "seconds": 129.2
+}

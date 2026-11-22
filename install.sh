@@ -47,7 +47,8 @@ fi
 if [[ $(git -C vendor/mlx-lm rev-parse HEAD) != "$MLX_LM_PIN" ]]; then
   git -C vendor/mlx-lm diff --quiet || die "vendor/mlx-lm has local changes and is not at the pin; remove vendor/ and re-run"
   say "checking out mlx-lm ${MLX_LM_PIN:0:12} (PR #2086)"
-  git -C vendor/mlx-lm fetch -q origin "pull/2086/head" || git -C vendor/mlx-lm fetch -q origin "$MLX_LM_PIN"
+  # Fetch the pinned commit by hash: the pull request branch can be force-pushed past it.
+  git -C vendor/mlx-lm fetch -q origin "$MLX_LM_PIN" || git -C vendor/mlx-lm fetch -q origin "pull/2086/head"
   git -C vendor/mlx-lm checkout -q --detach "$MLX_LM_PIN"
 fi
 patch_sha=$(shasum -a 256 "$PATCH" | cut -d' ' -f1)

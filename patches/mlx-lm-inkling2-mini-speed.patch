@@ -1,20 +1,238 @@
+diff --git a/mlx_lm/models/inkling2/checkpoint.py b/mlx_lm/models/inkling2/checkpoint.py
+index 6438b0c..b4adad5 100644
+--- a/mlx_lm/models/inkling2/checkpoint.py
++++ b/mlx_lm/models/inkling2/checkpoint.py
+@@ -82,14 +82,18 @@ def sanitize(model, weights: dict[str, mx.array]) -> dict[str, mx.array]:
+         if k.endswith(("cross_pass_queries", "cross_pass_kv_queries")):
+             message_queries["kv" if "_kv_" in k else "q"] = v
+             continue
+-        if k.endswith(
++        if k.endswith(".mlp.gate.weight"):
++            v = v.astype(mx.float32)
++        elif k.endswith(
+             (
+-                ".mlp.gate.weight",
+                 ".forget_gate_proj.weight",
+                 ".message_gate_proj.weight",
+             )
+         ):
+-            v = v.astype(mx.float32)
++            if v.dtype == mx.float32 and bool(mx.all((v.view(mx.uint32) & 0xFFFF) == 0)):
++                v = v.astype(mx.bfloat16)
++            elif v.dtype != mx.bfloat16:
++                v = v.astype(mx.float32)
+         elif m := experts.match(k):
+             prefix, which, suffix = m.groups()
+             name = f"{prefix}.{'gate_up_proj' if which == 'w13' else 'down_proj'}"
+diff --git a/mlx_lm/models/inkling2/config.py b/mlx_lm/models/inkling2/config.py
+index a82e69f..74f58ae 100644
+--- a/mlx_lm/models/inkling2/config.py
++++ b/mlx_lm/models/inkling2/config.py
+@@ -74,8 +74,14 @@ class ModelArgs(BaseModelArgs):
+     text_config: dict
+     vision_config: dict | None = None
+     image_token_id: int = 200054
++    kv_bits: int | None = None
++    kv_start: int = 65536
+ 
+     def __post_init__(self):
++        if self.kv_bits not in (None, 4, 8):
++            raise ValueError("Inkling KV bits must be None, 4, or 8.")
++        if self.kv_start < 0:
++            raise ValueError("Inkling KV start must be nonnegative.")
+         self.text = TextArgs.from_dict(self.text_config)
+         self.vision = None
+         if self.vision_config:
 diff --git a/mlx_lm/models/inkling2/kernels.py b/mlx_lm/models/inkling2/kernels.py
-index 6279769..ee9fb66 100644
+index 6279769..6a4f842 100644
 --- a/mlx_lm/models/inkling2/kernels.py
 +++ b/mlx_lm/models/inkling2/kernels.py
-@@ -5,8 +5,11 @@ import mlx.core as mx
+@@ -5,8 +5,13 @@ import mlx.core as mx
  from mlx_lm.kernels.common import row_threads, scalar
  
  __all__ = [
 +    "decode_relative_mask",
++    "decode_relative_mask_from_rel",
      "depth_attention",
++    "message_gate_up",
 +    "moe_convolution",
      "relative_attention",
 +    "short_convolution",
  ]
  
  
-@@ -320,3 +323,178 @@ def relative_attention(
+@@ -93,6 +98,96 @@ _depth_attention_kernel = mx.fast.metal_kernel(
+     source=_DEPTH_ATTENTION_SOURCE,
+ )
+ 
++# Register-cached single-pass depth_attention with identical reduction order
++# (bit-exact with _DEPTH_ATTENTION_SOURCE, avoids second global read and
++# redundant per-thread softmax).
++_DEPTH_ATTENTION_CACHED_SOURCE = """
++    constexpr int N = K + 1;
++    constexpr int PER = (D + TG - 1) / TG;
++    constexpr uint NSG = TG / 32;
++    uint row = threadgroup_position_in_grid.x;
++    uint rows = threadgroups_per_grid.x;
++    uint tid = thread_position_in_threadgroup.x;
++    uint lane = thread_index_in_simdgroup;
++    uint sg = simdgroup_index_in_threadgroup;
++
++    float xr[PER][N];
++    float acc[N * Q];
++    for (int i = 0; i < N * Q; ++i) {
++        acc[i] = 0.0f;
++    }
++
++    for (int p = 0; p < PER; ++p) {
++        int d = int(tid) + p * TG;
++        if (d < D) {
++            for (int i = 0; i < K; ++i) {
++                xr[p][i] = blocks[(size_t(i) * rows + row) * D + d];
++            }
++            xr[p][K] = partial[size_t(row) * D + d];
++            for (int j = 0; j < Q; ++j) {
++                float qv = queries[j * D + d];
++                for (int i = 0; i < N; ++i) {
++                    acc[i * Q + j] += xr[p][i] * qv;
++                }
++            }
++        }
++    }
++
++    threadgroup float buf[N * Q][NSG];
++    for (int i = 0; i < N * Q; ++i) {
++        float v = simd_sum(acc[i]);
++        if (lane == 0) {
++            buf[i][sg] = v;
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    threadgroup float sw[N * Q];
++    if (sg == 0 && lane < uint(Q)) {
++        uint j = lane;
++        float w[N];
++        float m = -INFINITY;
++        for (int i = 0; i < N; ++i) {
++            float t = 0.0f;
++            for (uint s = 0; s < NSG; ++s) {
++                t += buf[i * Q + j][s];
++            }
++            t *= scale;
++            w[i] = t;
++            m = max(m, t);
++        }
++        float z = 0.0f;
++        for (int i = 0; i < N; ++i) {
++            w[i] = metal::exp(w[i] - m);
++            z += w[i];
++        }
++        for (int i = 0; i < N; ++i) {
++            sw[i * Q + j] = w[i] / z;
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (int p = 0; p < PER; ++p) {
++        int d = int(tid) + p * TG;
++        if (d < D) {
++            for (int j = 0; j < Q; ++j) {
++                float o = 0.0f;
++                for (int i = 0; i < N; ++i) {
++                    o += sw[i * Q + j] * xr[p][i];
++                }
++                out[(size_t(row) * Q + j) * D + d] = o;
++            }
++        }
++    }
++"""
++
++_depth_attention_cached_kernel = mx.fast.metal_kernel(
++    name="depth_attention_cached",
++    input_names=["blocks", "partial", "queries", "scale"],
++    output_names=["out"],
++    source=_DEPTH_ATTENTION_CACHED_SOURCE,
++)
++
+ 
+ def depth_attention(
+     blocks: mx.array, partial: mx.array, queries: mx.array, *, scale: float
+@@ -101,10 +196,16 @@ def depth_attention(
+     queries: float32 (Q, D). Returns (..., Q, D)."""
+     D = partial.shape[-1]
+     Q = queries.shape[0]
++    K = blocks.shape[0]
+     TG = row_threads(D)
+-    return _depth_attention_kernel(
++    kernel = (
++        _depth_attention_cached_kernel
++        if K <= 6 and Q <= 32 and (D + TG - 1) // TG <= 8
++        else _depth_attention_kernel
++    )
++    return kernel(
+         inputs=[blocks, partial, queries, scalar(scale)],
+-        template=[("K", blocks.shape[0]), ("D", D), ("Q", Q), ("TG", TG)],
++        template=[("K", K), ("D", D), ("Q", Q), ("TG", TG)],
+         grid=(partial.size // D * TG, 1, 1),
+         threadgroup=(TG, 1, 1),
+         output_shapes=[partial.shape[:-1] + (Q, D)],
+@@ -121,7 +222,7 @@ _TG = 128
+ 
+ # The online softmax of each row starts from its sink logit, so the zero-value
+ # sink needs no key.
+-_RELATIVE_ATTENTION_SOURCE = """
++_RELATIVE_ATTENTION_SETUP = """
+     constexpr float LOG2E = 1.4426950408889634f;
+     constexpr int BK = 16;
+     constexpr int LDK = BK + 8;
+@@ -173,11 +274,14 @@ _RELATIVE_ATTENTION_SOURCE = """
+     const int last_diag = S - L + min(q0 + BQ, L) - 1;
+     int first_key = WINDOW > 0 ? max(0, first_diag - WINDOW + 1) : 0;
+     first_key = max(first_key, start);
+-    const device T* k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
+-    const device T* v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
++"""
+ 
++_RELATIVE_ATTENTION_LOOP = """\
+     for (int k0 = first_key / BK * BK; k0 <= last_diag; k0 += BK) {
+         threadgroup_barrier(mem_flags::mem_threadgroup);
++"""
++
++_RELATIVE_ATTENTION_PLAIN_TILE = """\
+         for (int c = tid; c < BK * D / 8; c += TG) {
+             const int r = c / (D / 8);
+             const int col = (c % (D / 8)) * 8;
+@@ -197,6 +301,9 @@ _RELATIVE_ATTENTION_SOURCE = """
+                 Vs[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
+             }
+         }
++"""
++
++_RELATIVE_ATTENTION_ACCUMULATE = """\
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+         if (q0 + int(sg) * 8 >= L) {
+             continue;
+@@ -268,6 +375,18 @@ _RELATIVE_ATTENTION_SOURCE = """
+     }
+ """
+ 
++_RELATIVE_ATTENTION_SOURCE = (
++    _RELATIVE_ATTENTION_SETUP
++    + """\
++    const device T* k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
++    const device T* v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
++
++"""
++    + _RELATIVE_ATTENTION_LOOP
++    + _RELATIVE_ATTENTION_PLAIN_TILE
++    + _RELATIVE_ATTENTION_ACCUMULATE
++)
++
+ _relative_attention_kernel = mx.fast.metal_kernel(
+     name="relative_attention",
+     input_names=["q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale"],
+@@ -320,3 +439,343 @@ def relative_attention(
          output_shapes=[(B, L, Hq, D)],
          output_dtypes=[q.dtype],
      )[0]
@@ -55,6 +273,67 @@ index 6279769..ee9fb66 100644
 +        threadgroup=(128, 1, 1),
 +        output_shapes=[(heads, key_count)],
 +        output_dtypes=[dtype],
++    )[0]
++
++
++_DECODE_RELATIVE_MASK_FROM_REL_SOURCE = """
++    uint key = thread_position_in_grid.x;
++    uint head = thread_position_in_grid.y;
++    int distance = last_slot - int(key);
++    if (distance < 0) {
++        distance += int(key_count);
++    }
++    bfloat16_t value = bfloat16_t(0);
++    if (WINDOW > 0 && distance >= WINDOW) {
++        value = bfloat16_t(-INFINITY);
++    } else if (distance < R) {
++        const device uint4* rp = (const device uint4*)(rel + size_t(head) * 16);
++        const device uint4* pp = (const device uint4*)(rel_proj_t + size_t(distance) * 16);
++        uint4 r0 = rp[0], r1 = rp[1];
++        uint4 p0 = pp[0], p1 = pp[1];
++        float acc = 0.0f;
++        acc += as_type<float>(r0.x << 16) * as_type<float>(p0.x << 16);
++        acc += as_type<float>(r0.x & 0xFFFF0000u) * as_type<float>(p0.x & 0xFFFF0000u);
++        acc += as_type<float>(r0.y << 16) * as_type<float>(p0.y << 16);
++        acc += as_type<float>(r0.y & 0xFFFF0000u) * as_type<float>(p0.y & 0xFFFF0000u);
++        acc += as_type<float>(r0.z << 16) * as_type<float>(p0.z << 16);
++        acc += as_type<float>(r0.z & 0xFFFF0000u) * as_type<float>(p0.z & 0xFFFF0000u);
++        acc += as_type<float>(r0.w << 16) * as_type<float>(p0.w << 16);
++        acc += as_type<float>(r0.w & 0xFFFF0000u) * as_type<float>(p0.w & 0xFFFF0000u);
++        acc += as_type<float>(r1.x << 16) * as_type<float>(p1.x << 16);
++        acc += as_type<float>(r1.x & 0xFFFF0000u) * as_type<float>(p1.x & 0xFFFF0000u);
++        acc += as_type<float>(r1.y << 16) * as_type<float>(p1.y << 16);
++        acc += as_type<float>(r1.y & 0xFFFF0000u) * as_type<float>(p1.y & 0xFFFF0000u);
++        acc += as_type<float>(r1.z << 16) * as_type<float>(p1.z << 16);
++        acc += as_type<float>(r1.z & 0xFFFF0000u) * as_type<float>(p1.z & 0xFFFF0000u);
++        acc += as_type<float>(r1.w << 16) * as_type<float>(p1.w << 16);
++        acc += as_type<float>(r1.w & 0xFFFF0000u) * as_type<float>(p1.w & 0xFFFF0000u);
++        value = bfloat16_t(acc);
++    }
++    mask[head * key_count + key] = value;
++"""
++
++_decode_relative_mask_from_rel_kernel = mx.fast.metal_kernel(
++    name="decode_relative_mask_from_rel",
++    input_names=["rel", "rel_proj_t", "key_count", "last_slot"],
++    output_names=["mask"],
++    source=_DECODE_RELATIVE_MASK_FROM_REL_SOURCE,
++)
++
++
++def decode_relative_mask_from_rel(
++    rel: mx.array, rel_proj_t: mx.array, key_count: int, last_slot: int, window: int
++) -> mx.array:
++    """Bit-exact fused rel_logits_proj + decode_relative_mask for d_rel=16 BF16."""
++    heads = rel.shape[-2]
++    extent = rel_proj_t.shape[0]
++    return _decode_relative_mask_from_rel_kernel(
++        inputs=[rel, rel_proj_t, mx.array(key_count, mx.uint32), mx.array(last_slot, mx.int32)],
++        template=[("R", extent), ("WINDOW", window)],
++        grid=(key_count, heads, 1),
++        threadgroup=(128, 1, 1),
++        output_shapes=[(heads, key_count)],
++        output_dtypes=[mx.bfloat16],
 +    )[0]
 +
 +
@@ -129,10 +408,12 @@ index 6279769..ee9fb66 100644
 +    for (uint tap = 0; tap < 3; ++tap) {
 +        uint slot = tap * CHANNELS + channel;
 +        float sample = previous[slot];
-+        window[slot] = sample;
++        if (tap > 0) {
++            window[(tap - 1) * CHANNELS + channel] = sample;
++        }
 +        acc = fma(float(bfloat16_t(sample)), float(taps[tap]), acc);
 +    }
-+    window[3 * CHANNELS + channel] = float(hidden);
++    window[2 * CHANNELS + channel] = float(hidden);
 +    acc = fma(float(hidden), float(taps[3]), acc);
 +    bfloat16_t convolved = bfloat16_t(
 +        (float(bfloat16_t(acc)) + float(hidden)) / divisor
@@ -155,7 +436,7 @@ index 6279769..ee9fb66 100644
 +        template=[("CHANNELS", channels), ("EXPERTS", experts.shape[-2])],
 +        grid=(channels, 1, 1),
 +        threadgroup=(128, 1, 1),
-+        output_shapes=[residual.shape, (1, 4, channels)],
++        output_shapes=[residual.shape, (1, 3, channels)],
 +        output_dtypes=[mx.bfloat16, mx.float32],
 +    )
 +    return output, window
@@ -193,8 +474,110 @@ index 6279769..ee9fb66 100644
 +        output_shapes=[routing.shape[:-1] + (channels,)],
 +        output_dtypes=[mx.float32],
 +    )[0]
++
++
++_MESSAGE_GATE_UP_SOURCE = """
++    // Matches MLX gemv (sn=4, tn=4) + precise::tanh + non-contracted blend bit-for-bit.
++    uint sg_id = thread_position_in_grid.x / 32;
++    uint lane = thread_index_in_simdgroup;
++    uint c = lane & 3u;
++    uint row_in_sg = lane >> 2;
++    uint base_row = sg_id * (8 * ROWS_PER_SG) + row_in_sg;
++
++    float4 z0 = *(const device float4*)(z + c * 4);
++    float4 z1 = *(const device float4*)(z + 16 + c * 4);
++    float4 z2 = *(const device float4*)(z + 32 + c * 4);
++    float4 z3 = *(const device float4*)(z + 48 + c * 4);
++
++    for (uint k = 0; k < ROWS_PER_SG; ++k) {
++        uint row = base_row + k * 8;
++        if (row >= D) break;
++        const device uint2* fp = (const device uint2*)(forget_w + size_t(row) * R);
++        const device uint2* mp = (const device uint2*)(msg_w + size_t(row) * R);
++
++        float af = 0.0f, am = 0.0f;
++        uint2 f0 = fp[c], f1 = fp[4 + c], f2 = fp[8 + c], f3 = fp[12 + c];
++        af += as_type<float>(f0.x << 16) * z0.x;
++        af += as_type<float>(f0.x & 0xFFFF0000u) * z0.y;
++        af += as_type<float>(f0.y << 16) * z0.z;
++        af += as_type<float>(f0.y & 0xFFFF0000u) * z0.w;
++        af += as_type<float>(f1.x << 16) * z1.x;
++        af += as_type<float>(f1.x & 0xFFFF0000u) * z1.y;
++        af += as_type<float>(f1.y << 16) * z1.z;
++        af += as_type<float>(f1.y & 0xFFFF0000u) * z1.w;
++        af += as_type<float>(f2.x << 16) * z2.x;
++        af += as_type<float>(f2.x & 0xFFFF0000u) * z2.y;
++        af += as_type<float>(f2.y << 16) * z2.z;
++        af += as_type<float>(f2.y & 0xFFFF0000u) * z2.w;
++        af += as_type<float>(f3.x << 16) * z3.x;
++        af += as_type<float>(f3.x & 0xFFFF0000u) * z3.y;
++        af += as_type<float>(f3.y << 16) * z3.z;
++        af += as_type<float>(f3.y & 0xFFFF0000u) * z3.w;
++
++        uint2 m0 = mp[c], m1 = mp[4 + c], m2 = mp[8 + c], m3 = mp[12 + c];
++        am += as_type<float>(m0.x << 16) * z0.x;
++        am += as_type<float>(m0.x & 0xFFFF0000u) * z0.y;
++        am += as_type<float>(m0.y << 16) * z0.z;
++        am += as_type<float>(m0.y & 0xFFFF0000u) * z0.w;
++        am += as_type<float>(m1.x << 16) * z1.x;
++        am += as_type<float>(m1.x & 0xFFFF0000u) * z1.y;
++        am += as_type<float>(m1.y << 16) * z1.z;
++        am += as_type<float>(m1.y & 0xFFFF0000u) * z1.w;
++        am += as_type<float>(m2.x << 16) * z2.x;
++        am += as_type<float>(m2.x & 0xFFFF0000u) * z2.y;
++        am += as_type<float>(m2.y << 16) * z2.z;
++        am += as_type<float>(m2.y & 0xFFFF0000u) * z2.w;
++        am += as_type<float>(m3.x << 16) * z3.x;
++        am += as_type<float>(m3.x & 0xFFFF0000u) * z3.y;
++        am += as_type<float>(m3.y << 16) * z3.z;
++        am += as_type<float>(m3.y & 0xFFFF0000u) * z3.w;
++
++        af += simd_shuffle_down(af, 2);
++        af += simd_shuffle_down(af, 1);
++        am += simd_shuffle_down(am, 2);
++        am += simd_shuffle_down(am, 1);
++
++        if (c == 0) {
++            float fg = metal::precise::tanh(af);
++            float mg = metal::precise::tanh(am);
++            {
++                #pragma clang fp contract(off)
++                out[row] = (1.0f - fg) * h[row] + mg * m[row];
++            }
++        }
++    }
++"""
++
++_message_gate_up_kernel = mx.fast.metal_kernel(
++    name="inkling2_message_gate_up",
++    input_names=["z", "h", "m", "forget_w", "msg_w"],
++    output_names=["out"],
++    source=_MESSAGE_GATE_UP_SOURCE,
++)
++
++
++def message_gate_up(
++    z: mx.array,
++    hidden_states: mx.array,
++    message: mx.array,
++    forget_weight: mx.array,
++    message_weight: mx.array,
++) -> mx.array:
++    """Single-token bit-exact fused MessageGate up-projections, tanh and blend."""
++    D = hidden_states.shape[-1]
++    R = forget_weight.shape[1]
++    rps = 2
++    n_sg = (D + 8 * rps - 1) // (8 * rps)
++    return _message_gate_up_kernel(
++        inputs=[z, hidden_states, message, forget_weight, message_weight],
++        template=[("D", D), ("R", R), ("ROWS_PER_SG", rps)],
++        grid=(n_sg * 32, 1, 1),
++        threadgroup=(128, 1, 1),
++        output_shapes=[hidden_states.shape],
++        output_dtypes=[mx.float32],
++    )[0]
 diff --git a/mlx_lm/models/inkling2/layers.py b/mlx_lm/models/inkling2/layers.py
-index 66816c4..3c03926 100644
+index 66816c4..46b947a 100644
 --- a/mlx_lm/models/inkling2/layers.py
 +++ b/mlx_lm/models/inkling2/layers.py
 @@ -1,6 +1,7 @@
@@ -205,17 +588,26 @@ index 66816c4..3c03926 100644
  from functools import partial
  from typing import Any
  
-@@ -10,9 +11,16 @@ from mlx.nn.layers.distributed import sum_gradients
+@@ -10,9 +11,25 @@ from mlx.nn.layers.distributed import sum_gradients
  
  from mlx_lm.kernels.expert_routing import expert_routing
  from mlx_lm.layers.moe import SwitchLinear, _gather_sort, _scatter_unsort
 -from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
-+from mlx_lm.models.cache import BatchRotatingKVCache, KVCache, RotatingKVCache
++from mlx_lm.models.cache import (
++    BatchKVCache,
++    BatchRotatingKVCache,
++    KVCache,
++    QuantizedKVCache,
++    RotatingKVCache,
++)
++from mlx_lm.models.inkling2 import quantized_attention
  from mlx_lm.models.inkling2.config import TextArgs
 -from mlx_lm.models.inkling2.kernels import depth_attention, relative_attention
 +from mlx_lm.models.inkling2.kernels import (
 +    decode_relative_mask,
++    decode_relative_mask_from_rel,
 +    depth_attention,
++    message_gate_up,
 +    moe_convolution,
 +    relative_attention,
 +    short_convolution,
@@ -224,20 +616,38 @@ index 66816c4..3c03926 100644
  
  __all__ = [
      "Attention",
-@@ -112,7 +120,11 @@ def _conv_input(
+@@ -90,6 +107,15 @@ class RelativeLogits(nn.Module):
+     def __init__(self, d_rel: int, rel_extent: int):
+         super().__init__()
+         self.proj = mx.zeros((d_rel, rel_extent))
++        object.__setattr__(self, "_proj_t_cache", None)
++
++    def proj_t_bf16(self) -> mx.array:
++        cached = self._proj_t_cache
++        if cached is None or cached[0] is not self.proj:
++            pt = mx.contiguous(self.proj.astype(mx.bfloat16).T)
++            object.__setattr__(self, "_proj_t_cache", (self.proj, pt))
++            return pt
++        return cached[1]
+ 
+     def __call__(self, relative_states: mx.array) -> mx.array:
+         return relative_states @ self.proj.astype(relative_states.dtype)
+@@ -112,7 +138,13 @@ def _conv_input(
  
  def _conv_state(window: mx.array, lengths: mx.array | None, n: int) -> mx.array:
      if lengths is None:
 -        pos = mx.arange(window.shape[1] - n, window.shape[1])[None, :, None]
 +        start = window.shape[1] - n
-+        if start in (0, 1):
-+            # A compact state or a view retaining at most one extra token.
-+            return window[:, start:]
++        if start == 0:
++            return window
++        if start == 1:
++            # A view retaining at most one extra token.
++            return window[:, 1:]
 +        pos = mx.arange(start, window.shape[1])[None, :, None]
      else:
          ends = mx.clip(lengths, 0, window.shape[1] - n)
          pos = (ends[:, None] + mx.arange(n))[..., None]
-@@ -131,8 +143,29 @@ class ShortConvolution(nn.Module):
+@@ -131,8 +163,29 @@ class ShortConvolution(nn.Module):
          hidden_states: mx.array,
          conv_state: mx.array | None,
          conv_mask: mx.array | None,
@@ -262,12 +672,12 @@ index 66816c4..3c03926 100644
 +                    hidden_states,
 +                    conv_state,
 +                    weight,
-+                    state_only=compact_state and hidden_states.shape[1] > 1,
++                    state_only=compact_state,
 +                )
          residual = hidden_states.astype(mx.float32)
          window = _conv_input(hidden_states, conv_state, conv_mask, K)
          # As the reference, the conv runs in the weight dtype.
-@@ -266,16 +299,15 @@ class Attention(nn.Module):
+@@ -266,16 +319,15 @@ class Attention(nn.Module):
          )
          self.eps = args.rms_norm_eps
  
@@ -286,7 +696,24 @@ index 66816c4..3c03926 100644
          B, L, _ = hidden_states.shape
          gate = self.gate_proj(hidden_states)
          sinks = self.sink_proj(hidden_states)
-@@ -302,16 +334,43 @@ class Attention(nn.Module):
+@@ -297,21 +349,59 @@ class Attention(nn.Module):
+             relative_states = (relative_states.astype(mx.float32) * tau).astype(
+                 relative_states.dtype
+             )
+-        position_bias = self.rel_logits_proj(relative_states)
++        if (
++            L == 1
++            and B == 1
++            and not self.training
++            and _use_kernels()
++            and relative_states.dtype == mx.bfloat16
++            and relative_states.shape[-1] == 16
++        ):
++            # Defer relative-position dot product into decode_relative_mask_from_rel.
++            position_bias = relative_states
++        else:
++            position_bias = self.rel_logits_proj(relative_states)
+ 
          query_states = query_states.transpose(0, 2, 1, 3)
          key_states = key_states.transpose(0, 2, 1, 3)
          value_states = value_states.transpose(0, 2, 1, 3)
@@ -335,7 +762,7 @@ index 66816c4..3c03926 100644
      def _attention(self, query, key, value, position_bias, sinks, cache) -> mx.array:
          B, _, L, _ = query.shape
          S = key.shape[2]
-@@ -330,18 +389,30 @@ class Attention(nn.Module):
+@@ -330,18 +420,44 @@ class Attention(nn.Module):
                  key_start=key_start,
              )
  
@@ -353,6 +780,7 @@ index 66816c4..3c03926 100644
 -            mask = mx.where(visible, bias, -mx.inf).astype(query.dtype)
 +            # Plain caches have no padding. The latest physical slot is
 +            # enough to map every key to its relative distance.
++            deferred = position_bias.shape[-1] == self.rel_logits_proj.proj.shape[0]
 +            if (
 +                not self.training
 +                and _use_kernels()
@@ -360,10 +788,23 @@ index 66816c4..3c03926 100644
 +                and end >= S
 +            ):
 +                last_slot = cache._idx - 1 if type(cache) is RotatingKVCache else S - 1
-+                mask = decode_relative_mask(
-+                    position_bias, S, last_slot, self.sliding_window, query.dtype
-+                )
++                if deferred and query.dtype == mx.bfloat16:
++                    mask = decode_relative_mask_from_rel(
++                        position_bias,
++                        self.rel_logits_proj.proj_t_bf16(),
++                        S,
++                        last_slot,
++                        self.sliding_window,
++                    )
++                else:
++                    if deferred:
++                        position_bias = self.rel_logits_proj(position_bias)
++                    mask = decode_relative_mask(
++                        position_bias, S, last_slot, self.sliding_window, query.dtype
++                    )
 +            else:
++                if deferred:
++                    position_bias = self.rel_logits_proj(position_bias)
 +                query_positions = _positions(end - L, L)
 +                key_positions = _key_positions(cache, S, L, end)
 +                distance = query_positions.reshape(1) - key_positions.reshape(S)
@@ -377,16 +818,45 @@ index 66816c4..3c03926 100644
              attn_output = mx.fast.scaled_dot_product_attention(
                  query,
                  key,
-@@ -352,6 +423,8 @@ class Attention(nn.Module):
+@@ -352,6 +468,37 @@ class Attention(nn.Module):
              )
              return attn_output.transpose(0, 2, 1, 3)
  
 +        query_positions = _positions(end - L, L)
 +        key_positions = _key_positions(cache, S, L, end)
++        if L == 1 and B > 1 and bf16 and not self.training and _use_kernels() and isinstance(
++            cache, (BatchKVCache, BatchRotatingKVCache)
++        ):
++            # The fused decoder takes one input-dependent sink per head, so
++            # invoke it per row while keeping the rest of the model batched.
++            distance = query_positions - key_positions
++            extent = position_bias.shape[-1]
++            indices = mx.broadcast_to(
++                mx.clip(distance[:, None, :], 0, extent - 1),
++                (B, query.shape[1], S),
++            )
++            bias = mx.take_along_axis(position_bias[:, 0], indices, axis=-1)
++            bias = mx.where(distance[:, None, :] < extent, bias, 0)
++            visible = (distance >= 0) & (key_positions >= 0)
++            if self.sliding_window:
++                visible &= distance < self.sliding_window
++            mask = mx.where(visible[:, None, :], bias, -mx.inf).astype(query.dtype)
++            attn_output = mx.concatenate([
++                mx.fast.scaled_dot_product_attention(
++                    query[i:i + 1],
++                    key[i:i + 1],
++                    value[i:i + 1],
++                    scale=self.scaling,
++                    mask=mask[i:i + 1, :, None, :],
++                    sinks=sinks[i, 0].astype(query.dtype),
++                )
++                for i in range(B)
++            ])
++            return attn_output.transpose(0, 2, 1, 3)
          return _attention_reference(
              query,
              key,
-@@ -372,30 +445,27 @@ class SlidingAttention(Attention):
+@@ -372,30 +519,27 @@ class SlidingAttention(Attention):
          self.k_sconv = ShortConvolution(dims, args.sconv_kernel_size)
          self.v_sconv = ShortConvolution(dims, args.sconv_kernel_size)
  
@@ -423,11 +893,22 @@ index 66816c4..3c03926 100644
          )
  
  
-@@ -409,17 +479,15 @@ class FullAttention(Attention):
+@@ -409,17 +553,26 @@ class FullAttention(Attention):
          self.log_scaling_n_floor = args.log_scaling_n_floor
          self.log_scaling_alpha = args.log_scaling_alpha
  
 -    def __call__(
++    def attend(self, query, key, value, position_bias, sinks, cache):
++        if isinstance(cache, QuantizedKVCache):
++            if position_bias.shape[-1] == self.rel_logits_proj.proj.shape[0]:
++                # Single-token decode defers the relative projection to the BF16
++                # mask kernel; packed attention needs the projected bias.
++                position_bias = self.rel_logits_proj(position_bias)
++            return quantized_attention.attend_quantized(
++                query, key, value, position_bias, sinks, cache, scale=self.scaling
++            )
++        return super().attend(query, key, value, position_bias, sinks, cache)
++
 +    def project(
          self,
          hidden_states: mx.array,
@@ -444,7 +925,7 @@ index 66816c4..3c03926 100644
          key_states, conv_states[0] = self.k_sconv(
              self.k_proj(key_hidden_states),
              key_hidden_states,
-@@ -433,21 +501,23 @@ class FullAttention(Attention):
+@@ -433,20 +586,24 @@ class FullAttention(Attention):
              conv_mask,
          )
  
@@ -463,20 +944,21 @@ index 66816c4..3c03926 100644
 -            kv_cache,
 -            tau=tau[..., None, None],
 +            tau=tau,
-         )
- 
++        )
++
 +    def tau(self, cache, length):
 +        offset = cache.offset if cache is not None else 0
++        if isinstance(offset, int) and offset + length <= self.log_scaling_n_floor:
++            return None
 +        position_ids = _positions(offset, length).astype(mx.float32)
 +        tau = 1.0 + self.log_scaling_alpha * mx.log(
 +            mx.maximum((position_ids + 1) / self.log_scaling_n_floor, 1.0)
-+        )
+         )
 +        return tau[..., None, None]
-+
+ 
  
  class SoftcappedSwiGLU(nn.Module):
-     def __init__(self, args: TextArgs):
-@@ -469,7 +539,9 @@ class Experts(nn.Module):
+@@ -469,7 +626,9 @@ class Experts(nn.Module):
          self.down_proj = SwitchLinear(hidden, dims, num_experts, bias=False)
          self.act_fn = SoftcappedSwiGLU(args)
  
@@ -487,7 +969,7 @@ index 66816c4..3c03926 100644
          x = mx.expand_dims(x, (-2, -3))
          indices = mx.stop_gradient(indices)
          do_sort = indices.size >= 64
-@@ -480,6 +552,8 @@ class Experts(nn.Module):
+@@ -480,6 +639,8 @@ class Experts(nn.Module):
          x = self.act_fn(gate_up[..., 0::2], gate_up[..., 1::2])
          x = self.down_proj(x, idx, sorted_indices=do_sort)
          if do_sort:
@@ -496,7 +978,7 @@ index 66816c4..3c03926 100644
              x = _scatter_unsort(x, inv_order, indices.shape)
          return x.squeeze(-2)
  
-@@ -520,20 +594,42 @@ class SparseMoeBlock(nn.Module):
+@@ -520,20 +681,42 @@ class SparseMoeBlock(nn.Module):
          self.experts = Experts(args)
          self.sharding_group = None
  
@@ -543,7 +1025,43 @@ index 66816c4..3c03926 100644
  
  class BlockAttentionResidual(nn.Module):
      def __init__(self, dims: int, num_queries: int = 1):
-@@ -602,6 +698,7 @@ class DecoderLayer(nn.Module):
+@@ -571,15 +754,31 @@ class MessageGate(nn.Module):
+         self.message_gate_proj = nn.Linear(rank, dims, bias=False)
+ 
+     def __call__(self, hidden_states: mx.array, message: mx.array) -> mx.array:
++        dw = self.down_proj.weight
++        fw = self.forget_gate_proj.weight
++        mw = self.message_gate_proj.weight
+         states = mx.concatenate(
+             [unweighted_rms_norm(hidden_states), unweighted_rms_norm(message)],
+             axis=-1,
+         )
+-        states = self.down_proj(states.astype(self.down_proj.weight.dtype))
++        states = self.down_proj(states.astype(dw.dtype))
+         states = states.astype(mx.float32)
+-        forget_gate = mx.tanh(self.forget_gate_proj(states))
+-        message_gate = mx.tanh(self.message_gate_proj(states))
+-        return (1 - forget_gate) * hidden_states + message_gate * message
++        if (
++            hidden_states.shape[:2] == (1, 1)
++            and hidden_states.dtype == message.dtype == mx.float32
++            and fw.dtype == mw.dtype == mx.bfloat16
++            and states.shape[-1] == 64
++            and not self.training
++            and _use_kernels()
++        ):
++            return message_gate_up(states, hidden_states, message, fw, mw)
++        if fw.dtype != mx.float32:
++            fw = fw.astype(mx.float32)
++        if mw.dtype != mx.float32:
++            mw = mw.astype(mx.float32)
++        forget_gate = mx.tanh(states @ fw.T)
++        msg_gate = mx.tanh(states @ mw.T)
++        return (1 - forget_gate) * hidden_states + msg_gate * message
+ 
+ 
+ class MessageInput(nn.Module):
+@@ -602,6 +801,7 @@ class DecoderLayer(nn.Module):
          )
          self.mlp_input = BlockAttentionResidual(dims)
          self.mlp = SparseMoeBlock(args)
@@ -551,7 +1069,7 @@ index 66816c4..3c03926 100644
          self.post_attention_layernorm = nn.RMSNorm(dims, eps=args.rms_norm_eps)
          kernel_size = args.sconv_kernel_size
          self.post_attention_convolution = ShortConvolution(dims, kernel_size)
-@@ -621,29 +718,36 @@ class DecoderLayer(nn.Module):
+@@ -621,29 +821,36 @@ class DecoderLayer(nn.Module):
              self.v_message_gate(v_states, messages[..., 2, :]),
          )
  
@@ -581,12 +1099,12 @@ index 66816c4..3c03926 100644
 +            self.attention_input(block_states, normed_residual)
 +            if self.attention_input is not None
 +            else None
-+        )
-+        attention_states = self._attention_inputs(
-+            hidden_states, attention_inputs, messages
          )
 -        hidden_states, conv_states[2] = self.post_attention_convolution(
 -            hidden_states, conv_states[2], conv_mask
++        attention_states = self._attention_inputs(
++            hidden_states, attention_inputs, messages
++        )
 +        windows = list(states)
 +        projected = self.self_attn.project(*attention_states, windows, conv_mask, tau)
 +        return projected, windows, normed_residual
@@ -610,7 +1128,7 @@ index 66816c4..3c03926 100644
          )
  
          residual = hidden_states = hidden_states.astype(mx.float32)
-@@ -660,20 +764,107 @@ class DecoderLayer(nn.Module):
+@@ -660,20 +867,105 @@ class DecoderLayer(nn.Module):
          hidden_states = self.mlp_input(block_states, normed_states)[..., 0, :]
          if messages is not None:
              hidden_states = self.mlp_message_gate(hidden_states, messages[..., 3, :])
@@ -654,26 +1172,25 @@ index 66816c4..3c03926 100644
          )
 +        hidden_states = residual + hidden_states.astype(mx.float32)
 +        return hidden_states.astype(dtype), block_states, conv_states
- 
++
 +    def _inference_stages(self):
 +        if self._compiled_inference is None:
 +            # Capture parameter references so a compiled stage sees updated
 +            # weights. Keep the callbacks from owning the layer itself.
 +            layer = weakref.proxy(self)
-+            params = {}
++            params = dict(self)
 +
 +            @partial(mx.compile, inputs=params)
 +            def prepare(*args):
 +                return DecoderLayer._prepare(layer, *args)
-+
+ 
 +            @partial(mx.compile, inputs=params)
 +            def finish(*args):
 +                return DecoderLayer._finish(layer, *args)
 +
 +            # Store the compilation cache outside the nn.Module parameter tree.
 +            object.__setattr__(self, "_compiled_inference", (prepare, finish, params))
-+        prepare, finish, params = self._compiled_inference
-+        params.update(self)
++        prepare, finish, _ = self._compiled_inference
 +        return prepare, finish
 +
 +    def __call__(
@@ -689,9 +1206,8 @@ index 66816c4..3c03926 100644
 +        states = conv.cache if conv is not None else [None] * 4
 +        tau = self.self_attn.tau(kv_cache, hidden_states.shape[1])
 +        if (
-+            hidden_states.shape[0] == 1
-+            # Reuse the compiled stages for decode and full prefill chunks.
-+            and hidden_states.shape[1] in (1, 512)
++            # Decode can use the compiled stages for any batch width.
++            (hidden_states.shape[1] == 1 or hidden_states.shape[:2] == (1, 512))
 +            and not self.training
 +            and self.mlp.sharding_group is None
 +            and _use_kernels()
@@ -727,7 +1243,7 @@ index 66816c4..3c03926 100644
  
  
  class SlidingDecoderLayer(DecoderLayer):
-@@ -682,9 +873,7 @@ class SlidingDecoderLayer(DecoderLayer):
+@@ -682,9 +974,7 @@ class SlidingDecoderLayer(DecoderLayer):
          self.self_attn = SlidingAttention(args)
          self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
  
@@ -738,7 +1254,7 @@ index 66816c4..3c03926 100644
          dtype = hidden_states.dtype
          if attention_inputs is not None:
              hidden_states = attention_inputs[..., 0, :]
-@@ -693,12 +882,7 @@ class SlidingDecoderLayer(DecoderLayer):
+@@ -693,12 +983,7 @@ class SlidingDecoderLayer(DecoderLayer):
          else:
              states = self._mix_messages((hidden_states,) * 3, messages)
              states = [self.input_layernorm(s).astype(dtype) for s in states]
@@ -752,7 +1268,7 @@ index 66816c4..3c03926 100644
  
  
  class FullDecoderLayer(DecoderLayer):
-@@ -710,9 +894,7 @@ class FullDecoderLayer(DecoderLayer):
+@@ -710,9 +995,7 @@ class FullDecoderLayer(DecoderLayer):
          self.k_input_layernorm = nn.RMSNorm(args.hidden_size, eps=eps)
          self.v_input_layernorm = nn.RMSNorm(args.hidden_size, eps=eps)
  
@@ -763,7 +1279,7 @@ index 66816c4..3c03926 100644
          dtype = hidden_states.dtype
          if attention_inputs is None:
              query_states = key_states = value_states = hidden_states
-@@ -724,11 +906,8 @@ class FullDecoderLayer(DecoderLayer):
+@@ -724,11 +1007,8 @@ class FullDecoderLayer(DecoderLayer):
              query_states, key_states, value_states = self._mix_messages(
                  (query_states, key_states, value_states), messages
              )
@@ -777,10 +1293,32 @@ index 66816c4..3c03926 100644
 -            conv_mask=conv_mask,
          )
 diff --git a/mlx_lm/models/inkling2/model.py b/mlx_lm/models/inkling2/model.py
-index f860c2c..469de64 100644
+index f860c2c..a7d3afe 100644
 --- a/mlx_lm/models/inkling2/model.py
 +++ b/mlx_lm/models/inkling2/model.py
-@@ -18,6 +18,7 @@ from mlx_lm.models.inkling2.layers import (
+@@ -1,5 +1,6 @@
+ # Copyright © 2026 Apple Inc.
+ 
++from functools import partial
+ from typing import Any, Callable
+ 
+ import mlx.core as mx
+@@ -8,7 +9,13 @@ from mlx.nn.layers.distributed import shard_linear
+ 
+ from mlx_lm.layers.common import splice
+ from mlx_lm.layers.distributed import PipelineMixin, gather_last_axis
+-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
++from mlx_lm.models.cache import (
++    ArraysCache,
++    CacheList,
++    KVCache,
++    QuantizedKVCache,
++    RotatingKVCache,
++)
+ from mlx_lm.models.inkling2 import checkpoint
+ from mlx_lm.models.inkling2.config import ModelArgs, TextArgs
+ from mlx_lm.models.inkling2.layers import (
+@@ -18,6 +25,7 @@ from mlx_lm.models.inkling2.layers import (
      MessageInput,
      ShortConvolution,
      SlidingDecoderLayer,
@@ -788,7 +1326,7 @@ index f860c2c..469de64 100644
      unweighted_rms_norm,
  )
  from mlx_lm.models.inkling2.vision import VisionModel
-@@ -74,17 +75,48 @@ class TextModel(PipelineMixin, nn.Module):
+@@ -74,17 +82,48 @@ class TextModel(PipelineMixin, nn.Module):
      def _run_loop(self, hidden_states, cache, conv_mask):
          core = self.args.loop_core
          caches = iter(cache)
@@ -796,7 +1334,7 @@ index f860c2c..469de64 100644
 +            hidden_states.shape[0] == 1
 +            and hidden_states.shape[1] > 1
 +            and cache[0] is not None
-+            and type(cache[0][0]) in (KVCache, RotatingKVCache)
++            and type(cache[0][0]) in (KVCache, RotatingKVCache, QuantizedKVCache)
 +            and conv_mask is None
 +            and hidden_states.dtype == mx.bfloat16
 +            and not self.training
@@ -820,7 +1358,7 @@ index f860c2c..469de64 100644
                  )
 +                if stage_prefill:
 +                    pending.append(visit_cache)
-+                    if type(visit_cache[0]) is KVCache:
++                    if type(visit_cache[0]) in (KVCache, QuantizedKVCache):
 +                        # Submit this group's KV and convolution updates before
 +                        # building the graph for the next group of visits.
 +                        try:
@@ -838,3 +1376,213 @@ index f860c2c..469de64 100644
              return hidden_states, block_states
  
          prelude = run(self.layers[: core.start], hidden_states, None)
+@@ -145,7 +184,10 @@ class TextModel(PipelineMixin, nn.Module):
+             states = mx.distributed.send(states, (rank - 1) % size)
+             if cache[-1] is not None:
+                 kv_cache = cache[-1][0]
+-                kv_cache.keys = mx.depends(kv_cache.keys, states)
++                if isinstance(kv_cache, QuantizedKVCache):
++                    kv_cache.keys = tuple(mx.depends(k, states) for k in kv_cache.keys)
++                else:
++                    kv_cache.keys = mx.depends(kv_cache.keys, states)
+             # Only the output of rank 0 is used.
+             hidden_states = states[0].astype(dtype)
+         else:
+@@ -183,6 +225,12 @@ class Inkling2Model(nn.Module):
+         self.language_model.pipeline(group, split)
+ 
+ 
++@partial(mx.compile, shapeless=True)
++def _softcap_logits(logits: mx.array, softcap: float) -> mx.array:
++    logits = logits.astype(mx.float32)
++    return mx.tanh(logits / softcap) * softcap
++
++
+ class Model(nn.Module):
+     def __init__(self, args: ModelArgs):
+         super().__init__()
+@@ -228,6 +276,19 @@ class Model(nn.Module):
+         if pixel_values is not None:
+             assert input_embeddings is None, "Pass pixel_values or input_embeddings."
+             input_embeddings = self.embed_inputs(inputs, pixel_values=pixel_values)
++        if self.args.kv_bits is not None and cache is not None:
++            # Use the absolute cache offset so cold and resumed requests switch
++            # at the same forward boundary. Materialize one visit at a time to
++            # release its BF16 buffers before packing the next visit.
++            for visit in cache:
++                if visit is None:
++                    continue
++                kv, conv = visit
++                if type(kv) is KVCache and kv.offset >= self.args.kv_start:
++                    packed = kv.to_quantized(bits=self.args.kv_bits)
++                    if not packed.empty():
++                        mx.eval(packed.keys, packed.values)
++                    visit.caches = packed, conv
+         hidden_states = self.model.language_model(
+             inputs, cache=cache, input_embeddings=input_embeddings
+         )
+@@ -235,10 +296,9 @@ class Model(nn.Module):
+         if self.sharding_group is not None:
+             logits = gather_last_axis(logits, self.sharding_group)
+         text = self.args.text
+-        softcap = text.final_logit_softcapping
+-        logits = logits.astype(mx.float32)
+-        logits = mx.tanh(logits / softcap) * softcap
+-        return logits[..., : text.unpadded_vocab_size]
++        return _softcap_logits(
++            logits[..., : text.unpadded_vocab_size], text.final_logit_softcapping
++        )
+ 
+     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
+         return checkpoint.sanitize(self, weights)
+diff --git a/mlx_lm/models/inkling2/quantized_attention.py b/mlx_lm/models/inkling2/quantized_attention.py
+new file mode 100644
+index 0000000..6e788e7
+--- /dev/null
++++ b/mlx_lm/models/inkling2/quantized_attention.py
+@@ -0,0 +1,145 @@
++# Copyright © 2026 Apple Inc.
++
++import mlx.core as mx
++
++from mlx_lm.kernels.common import scalar
++from mlx_lm.models.inkling2.kernels import (
++    _BQ,
++    _RELATIVE_ATTENTION_ACCUMULATE,
++    _RELATIVE_ATTENTION_LOOP,
++    _RELATIVE_ATTENTION_SETUP,
++    _TG,
++    decode_relative_mask,
++)
++
++# Load affine codes straight into the same threadgroup tiles as BF16 prefill.
++# Each lane reconstructs eight values from one quantization group.
++_AFFINE_TILE = """
++        constexpr int PER_WORD = 32 / BITS;
++        constexpr uint CODE_MASK = (1u << BITS) - 1;
++        for (int c = tid; c < BK * D / 8; c += TG) {
++            const int r = c / (D / 8);
++            const int col = (c % (D / 8)) * 8;
++            const int key = k0 + r;
++            if (key < S) {
++                const auto kw = k + batch * k_strides[0] + kv_head * k_strides[1]
++                    + key * k_strides[2] + col / PER_WORD;
++                const auto vw = v + batch * v_strides[0] + kv_head * v_strides[1]
++                    + key * v_strides[2] + col / PER_WORD;
++                const int group = col / GROUP;
++                const auto ks = k_scale[batch * k_scale_strides[0]
++                    + kv_head * k_scale_strides[1] + key * k_scale_strides[2] + group];
++                const auto kb = k_bias[batch * k_bias_strides[0]
++                    + kv_head * k_bias_strides[1] + key * k_bias_strides[2] + group];
++                const auto vs = v_scale[batch * v_scale_strides[0]
++                    + kv_head * v_scale_strides[1] + key * v_scale_strides[2] + group];
++                const auto vb = v_bias[batch * v_bias_strides[0]
++                    + kv_head * v_bias_strides[1] + key * v_bias_strides[2] + group];
++                for (int j = 0; j < 8; ++j) {
++                    const int shift = (j % PER_WORD) * BITS;
++                    const float kc = float((kw[j / PER_WORD] >> shift) & CODE_MASK);
++                    const float vc = float((vw[j / PER_WORD] >> shift) & CODE_MASK);
++                    Ks[(col + j) * LDK + r] = half(float(T(fma(kc, float(ks), float(kb)))));
++                    Vs[r * LDV + col + j] = half(float(T(fma(vc, float(vs), float(vb)))));
++                }
++            } else {
++                for (int j = 0; j < 8; ++j) {
++                    Ks[(col + j) * LDK + r] = 0.0h;
++                    Vs[r * LDV + col + j] = 0.0h;
++                }
++            }
++        }
++"""
++
++_quantized_relative_attention = mx.fast.metal_kernel(
++    name="inkling_quantized_relative_attention",
++    input_names=[
++        "q",
++        "k",
++        "k_scale",
++        "k_bias",
++        "v",
++        "v_scale",
++        "v_bias",
++        "rel",
++        "sinks",
++        "key_start",
++        "sizes",
++        "scale",
++    ],
++    output_names=["out"],
++    source=(
++        _RELATIVE_ATTENTION_SETUP
++        + _RELATIVE_ATTENTION_LOOP
++        + _AFFINE_TILE
++        + _RELATIVE_ATTENTION_ACCUMULATE
++    ),
++    ensure_row_contiguous=False,
++)
++
++
++def _prefill(q, keys, values, rel, sinks, scale, group_size, bits):
++    batch, heads, length, dim = q.shape
++    kv_heads, context = keys[0].shape[1:3]
++    return _quantized_relative_attention(
++        inputs=[
++            q,
++            *keys,
++            *values,
++            mx.contiguous(rel),
++            mx.contiguous(sinks.astype(mx.float32)),
++            mx.zeros((batch,), dtype=mx.int32),
++            mx.array([length, context], dtype=mx.int32),
++            scalar(scale),
++        ],
++        template=[
++            ("T", q.dtype),
++            ("D", dim),
++            ("HQ", heads),
++            ("HKV", kv_heads),
++            ("R", rel.shape[-1]),
++            ("WINDOW", 0),
++            ("BQ", _BQ),
++            ("TG", _TG),
++            ("GROUP", group_size),
++            ("BITS", bits),
++        ],
++        grid=((length + _BQ - 1) // _BQ * _TG, heads, batch),
++        threadgroup=(_TG, 1, 1),
++        output_shapes=[(batch, length, heads, dim)],
++        output_dtypes=[q.dtype],
++    )[0]
++
++
++def _decode(q, keys, values, rel, sinks, scale, group_size, bits):
++    batch, heads, _, dim = q.shape
++    kv_heads, context = keys[0].shape[1:3]
++
++    grouped_q = q.reshape(batch, kv_heads, heads // kv_heads, 1, dim)
++    keys = tuple(x[:, :, None] for x in keys)
++    values = tuple(x[:, :, None] for x in values)
++    opts = dict(group_size=group_size, bits=bits)
++    logits = mx.quantized_matmul(
++        grouped_q.astype(mx.float32), *keys, transpose=True, **opts
++    ) * scale
++    if batch == 1:
++        bias = decode_relative_mask(rel, context, context - 1, 0, rel.dtype)
++    else:
++        distance = mx.arange(context - 1, -1, -1)
++        extent = rel.shape[-1]
++        bias = mx.take(rel[:, 0], mx.minimum(distance, extent - 1), axis=-1)
++        bias = mx.where(distance < extent, bias, 0)
++    logits += bias.reshape(batch, kv_heads, -1, 1, context)
++    # The sink participates in normalization and contributes a zero value.
++    sink_logits = sinks.astype(q.dtype).reshape(batch, kv_heads, -1, 1, 1)
++    probs = mx.softmax(mx.concatenate([logits, sink_logits], axis=-1), axis=-1)
++    out = mx.quantized_matmul(probs[..., :context], *values, transpose=False, **opts)
++    return out.reshape(batch, 1, heads, dim).astype(q.dtype)
++
++
++def attend_quantized(q, key, value, rel, sinks, cache, *, scale):
++    if mx.default_device() != mx.gpu or not mx.metal.is_available():
++        raise ValueError("Inkling quantized KV attention requires a Metal GPU.")
++    keys, values = cache.update_and_fetch(key, value)
++    attention = _decode if q.shape[2] == 1 else _prefill
++    return attention(q, keys, values, rel, sinks, scale, cache.group_size, cache.bits)

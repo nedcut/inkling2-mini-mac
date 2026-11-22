@@ -33,6 +33,7 @@ accepted for 3 tokens per step gives about 66 tokens/s; the bundled draft model 
 
 ## Where this setup is
 
-- Single-user decode: 44.5 tokens/s at short context, **about 64% of the 69 tokens/s ceiling** (31 tokens/s, 45%,
-  with the unpatched build). Most of the remaining time is in MLX's quantized expert matmul kernels.
+- Single-user decode: 46.5 tokens/s at short context, **about 67% of the 69 tokens/s ceiling** (44 tokens/s, 64%,
+  with the previous release; 31 tokens/s, 45%, with the unpatched build). Most of the remaining time is in MLX's
+  quantized expert matmul kernels.
 - Prefill: about 400-410 tokens/s at 4K, **at the practical ceiling**.

@@ -2,7 +2,7 @@
 
 Why this exists: on an M4 Pro, mlx_lm.server runs ~20% slower than the library's
 stream_generate, and it returns Inkling's raw control tokens. This server calls
-stream_generate directly (one request at a time, like a single-user local server)
+stream_generate directly for standalone requests, can batch simultaneous decode,
 and splits the reply into `reasoning_content`, `content` and `tool_calls`.
 
   python inkling_server.py --model DIR [--port 8790] [--prefill-step 512] [--max-context N]
@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 from contextlib import closing
+from types import SimpleNamespace
 from copy import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -130,8 +131,12 @@ def snapshot_prompt_cache(cache):
     for visit in cache:
         kv, conv = visit
         saved_kv = copy(kv)
-        saved_kv.keys = copy(kv.keys)
-        saved_kv.values = copy(kv.values)
+        if isinstance(kv.keys, tuple):
+            saved_kv.keys = tuple(map(copy, kv.keys))
+            saved_kv.values = tuple(map(copy, kv.values))
+        else:
+            saved_kv.keys = copy(kv.keys)
+            saved_kv.values = copy(kv.values)
         saved_conv = copy(conv)
         saved_conv.cache = [copy(state) for state in conv.cache]
         # The unbatched ArraysCache has no lengths or left padding.
@@ -146,6 +151,7 @@ class Job:
         self.sampler_args = sampler_args
         self.events = queue.Queue()
         self.cancelled = False
+        self.finished = False
 
 
 class Engine(threading.Thread):
@@ -160,6 +166,7 @@ class Engine(threading.Thread):
         self.tokenizer = None
         self.prompt_snapshot = None
         self.cache_types = None
+        self.pending = None
 
     def run(self):
         try:
@@ -181,24 +188,192 @@ class Engine(threading.Thread):
 
             self.stream_generate, self.make_sampler = stream_generate, make_sampler
             cfg = None if self.args.vision else {"vision_config": None}
-            self.model, self.tokenizer = load(self.args.model, model_config=cfg or {})
+            cfg = cfg or {}
+            if self.args.kv_bits is not None:
+                cfg.update(kv_bits=self.args.kv_bits, kv_start=self.args.kv_start)
+            self.model, self.tokenizer = load(self.args.model, model_config=cfg)
             if (not self.args.no_prompt_cache
                     and getattr(self.model, "model_type", None) == "inkling2_loop"):
-                from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
+                from mlx_lm.models.cache import (
+                    ArraysCache, CacheList, KVCache, QuantizedKVCache, RotatingKVCache,
+                )
 
-                self.cache_types = CacheList, (KVCache, RotatingKVCache), ArraysCache
+                self.cache_types = CacheList, (KVCache, RotatingKVCache, QuantizedKVCache), ArraysCache
+            self.mx = mx
             self._generate(Job(self.tokenizer.encode("hello"), 8, {"temp": 0.0}), warmup=True)
+            self.model_bytes = mx.get_active_memory()
+            self.batch_memory_cap = min(int(limit), 20_200_000_000)
+            if (self.args.decode_batch_size > 1
+                    and getattr(self.model, "model_type", None) != "inkling2_loop"):
+                raise ValueError("batched decode requires the text-only Inkling 2 Mini model")
         except Exception as e:  # surfaced by main()
             self.error = e
             self.ready.set()
             return
         self.ready.set()
         while True:
-            job = self.jobs.get()
+            job = self.pending or self.jobs.get()
+            self.pending = None
+            jobs = [job]
+            if job.cancelled:
+                job.events.put(("done", None))
+                continue
             try:
-                self._generate(job)
+                if self.args.decode_batch_size > 1:
+                    self._admit(jobs)
+                if len(jobs) > 1:
+                    self._generate_batch(jobs)
+                else:
+                    self._generate(job)
             except Exception as e:
-                job.events.put(("error", str(e)))
+                for failed in jobs:
+                    if not failed.finished:
+                        failed.events.put(("error", str(e)))
+
+    def _admit(self, jobs):
+        # Keep FIFO order and reserve for the padded batch at its largest
+        # requested length, including output. Unlimited requests run solo.
+        def length(job):
+            return len(job.prompt) + job.max_tokens if job.max_tokens > 0 else None
+
+        longest = length(jobs[0])
+        if longest is None or jobs[0].cancelled:
+            return
+        deadline = time.monotonic() + self.args.decode_batch_window_ms / 1000
+        while len(jobs) < self.args.decode_batch_size:
+            try:
+                remaining = deadline - time.monotonic()
+                job = self.jobs.get(timeout=remaining) if remaining > 0 else self.jobs.get_nowait()
+            except queue.Empty:
+                return
+            size = length(job)
+            if size is not None and not job.cancelled:
+                padded = (max(size, longest) + 255) // 256 * 256
+                # 8 global KV visits (32 KiB/token), 40 local visits and
+                # convolution state (~173 MB/stream), plus prefill workspace.
+                estimate = self.model_bytes + 1_250_000_000 + (
+                    len(jobs) + 1
+                ) * (padded * 32768 + 173_000_000)
+                if estimate < self.batch_memory_cap:
+                    longest = max(size, longest)
+                    jobs.append(job)
+                    continue
+            self.pending = job
+            return
+
+    def _prefill_batch_job(self, job):
+        # Read prompts one at a time with the same chunk shape and final-token
+        # pass as stream_generate. A multi-row prefill would multiply scratch.
+        mx = self.mx
+        cache = self.model.make_cache()
+        prompt = mx.array(job.prompt)
+        started = time.perf_counter()
+        for start in range(0, len(job.prompt) - 1, self.args.prefill_step):
+            if job.cancelled:
+                return None
+            end = min(start + self.args.prefill_step, len(job.prompt) - 1)
+            self.model(prompt[None, start:end], cache=cache)
+            mx.eval([visit.state for visit in cache])
+            mx.clear_cache()
+        logits = self.model(prompt[None, -1:], cache=cache)[:, -1, :]
+        try:
+            tokens = job.sampler(logits - mx.logsumexp(logits, keepdims=True))
+        except ValueError as error:
+            job.finished = True
+            job.events.put(("error", str(error)))
+            return None
+        mx.eval(tokens, [visit.state for visit in cache])
+        job.prompt_tps = len(job.prompt) / (time.perf_counter() - started)
+        return cache, tokens
+
+    def _batch_token(self, job, token):
+        if job.generated == 0:
+            job.started = time.perf_counter()
+        job.generated += 1
+        stopped = token in self.tokenizer.eos_token_ids
+        if not stopped:
+            job.detokenizer.add_token(token)
+        done = stopped or job.cancelled or job.generated >= job.max_tokens
+        if done:
+            job.detokenizer.finalize()
+        job.events.put(("text", job.detokenizer.last_segment))
+        if done:
+            job.finished = True
+            job.events.put(("done", SimpleNamespace(
+                generation_tokens=job.generated,
+                prompt_tps=job.prompt_tps,
+                generation_tps=job.generated / max(time.perf_counter() - job.started, 1e-6),
+                peak_memory=self.mx.get_peak_memory() / 1e9,
+                finish_reason="stop" if stopped else "length",
+            )))
+        return done
+
+    def _generate_batch(self, jobs):
+        from mlx_lm.generate import generation_stream, wired_limit
+
+        self.prompt_snapshot = None
+        mx = self.mx
+        active, caches, tokens = [], [], []
+        print(f"decode cohort: {len(jobs)} prompts={[len(j.prompt) for j in jobs]}", flush=True)
+        with wired_limit(self.model, [generation_stream]), mx.stream(generation_stream):
+            for job in jobs:
+                if job.cancelled:
+                    job.finished = True
+                    job.events.put(("done", None))
+                    continue
+                job.detokenizer = self.tokenizer.detokenizer
+                job.generated = 0
+                try:
+                    job.sampler = self.make_sampler(**job.sampler_args)
+                except ValueError as error:
+                    job.finished = True
+                    job.events.put(("error", str(error)))
+                    continue
+                result = self._prefill_batch_job(job)
+                if result is None:
+                    if not job.finished:
+                        job.finished = True
+                        job.events.put(("done", None))
+                    continue
+                cache, sampled = result
+                active.append(job)
+                caches.append(cache)
+                tokens.append(sampled)
+            if not active:
+                return
+            if len(caches) == 1:
+                batch_cache = caches[0]
+            else:
+                # Merge and release one visit at a time. Holding both complete
+                # unbatched and batched histories can exceed the memory budget.
+                del cache, result
+                batch_cache = []
+                for i in range(len(caches[0])):
+                    visits = [cache[i] for cache in caches]
+                    merged = visits[0].merge(visits)
+                    mx.eval(merged.state)
+                    batch_cache.append(merged)
+                    for cache in caches:
+                        cache[i] = None
+                del visits
+            sampled = mx.concatenate(tokens)
+            while active:
+                keep = [i for i, token in enumerate(sampled.tolist())
+                        if not self._batch_token(active[i], token)]
+                if not keep:
+                    break
+                if len(keep) != len(active):
+                    active = [active[i] for i in keep]
+                    # Release the old rows as each visit shrinks, like the merge.
+                    for visit in batch_cache:
+                        visit.filter(keep)
+                        mx.eval(visit.state)
+                    sampled = sampled[mx.array(keep)]
+                logits = self.model(sampled[:, None], cache=batch_cache)[:, -1, :]
+                logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+                sampled = mx.concatenate([
+                    job.sampler(logprobs[i : i + 1]) for i, job in enumerate(active)
+                ])
 
     def _generate(self, job, *, warmup=False):
         sampler = self.make_sampler(**job.sampler_args)
@@ -455,6 +630,10 @@ def main():
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--model-id", default="inkling-2-mini")
     ap.add_argument("--prefill-step", type=int, default=512)
+    ap.add_argument("--kv-bits", type=int, choices=(4, 8), nargs="?", const=8,
+                    help="pack full-attention KV after --kv-start (8 bits when used without a value)")
+    ap.add_argument("--kv-start", type=int, default=65536,
+                    help="cached tokens before switching at a forward boundary (default: 65536)")
     ap.add_argument("--no-prompt-cache", action="store_true",
                     help="disable prompt-prefix reuse across requests")
     ap.add_argument("--prompt-cache-max-tokens", type=int, default=16384,
@@ -470,7 +649,23 @@ def main():
     ap.add_argument("--vision", action="store_true",
                     help="load the vision tower too (no image API here; only for parity)")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--decode-batch-size", type=int, choices=(1, 2, 3, 4), default=1,
+                    help="maximum simultaneous decode requests (default: 1)")
+    ap.add_argument("--decode-batch-window-ms", type=float, default=15,
+                    help="maximum time to collect a decode cohort (default: 15 ms)")
     args = ap.parse_args()
+    if args.kv_start < 0:
+        ap.error("--kv-start must be nonnegative")
+    if not 0 <= args.decode_batch_window_ms <= 100:
+        ap.error("--decode-batch-window-ms must be between 0 and 100")
+    if args.decode_batch_size > 1:
+        if args.vision:
+            ap.error("batched decode requires the text-only model")
+        if not 1 <= args.prefill_step <= 512:
+            ap.error("batched decode requires --prefill-step between 1 and 512")
+        if args.kv_bits is not None:
+            # Batched decode was only qualified with BF16 KV.
+            ap.error("batched decode and --kv-bits cannot be combined")
     if args.prompt_cache_max_tokens < 0:
         ap.error("--prompt-cache-max-tokens must be nonnegative")
 

@@ -56,11 +56,14 @@ marker=vendor/.applied-patch-sha256
 if [[ -f $marker && $(<$marker) == "$patch_sha" ]] && ! git -C vendor/mlx-lm diff --quiet; then
   say "speed patch already applied"
 else
-  if ! git -C vendor/mlx-lm diff --quiet; then
-    # Only ever undo a patch this script applied itself (recorded in the marker).
-    [[ -f $marker ]] || die "vendor/mlx-lm has local changes this installer did not make; remove vendor/ and re-run"
+  if [[ -f $marker ]]; then
+    # Only ever undo a patch this script applied itself (recorded in the marker),
+    # including any files it added.
     say "replacing the previously applied patch"
     git -C vendor/mlx-lm checkout -q -- .
+    git -C vendor/mlx-lm clean -fdq
+  elif ! git -C vendor/mlx-lm diff --quiet; then
+    die "vendor/mlx-lm has local changes this installer did not make; remove vendor/ and re-run"
   fi
   say "applying the speed patch"
   git -C vendor/mlx-lm apply "$ROOT/$PATCH"

@@ -15,10 +15,13 @@ Keeps one prompt prefix in memory. Use --no-prompt-cache to disable it.
 """
 
 import argparse
+import atexit
 import json
 import pathlib
 import queue
 import re
+import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -154,6 +157,32 @@ class Job:
         self.finished = False
 
 
+def text_model_dir(path):
+    """mlx-community/Inkling-2-Mini-4bit's config.json leaves out vision_config.text_hidden_size, so
+    transformers 5.24 fills in its default (4608) and then rejects it for not matching text_config.hidden_size
+    (2304) when loading the tokenizer. Return a temporary folder that links the model's files with that one
+    value set, or `path` itself when the config needs no fix (or is not a local folder)."""
+    src = pathlib.Path(path)
+    try:
+        cfg = json.loads((src / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return path
+    vision, text = cfg.get("vision_config"), cfg.get("text_config")
+    if not (isinstance(vision, dict) and isinstance(text, dict) and "hidden_size" in text
+            and vision.get("text_hidden_size") != text["hidden_size"]):
+        return path
+    dst = pathlib.Path(tempfile.mkdtemp(prefix="inkling2-model-"))
+    atexit.register(shutil.rmtree, dst, ignore_errors=True)
+    for f in src.iterdir():
+        if f.name != "config.json":
+            (dst / f.name).symlink_to(f.resolve())
+    vision["text_hidden_size"] = text["hidden_size"]
+    (dst / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    print(f"using {dst} (links to {src}, config.json with vision_config.text_hidden_size = "
+          f"{text['hidden_size']})", flush=True)
+    return str(dst)
+
+
 class Engine(threading.Thread):
     """Owns the model; all MLX work happens on this one thread."""
 
@@ -191,7 +220,7 @@ class Engine(threading.Thread):
             cfg = cfg or {}
             if self.args.kv_bits is not None:
                 cfg.update(kv_bits=self.args.kv_bits, kv_start=self.args.kv_start)
-            self.model, self.tokenizer = load(self.args.model, model_config=cfg)
+            self.model, self.tokenizer = load(text_model_dir(self.args.model), model_config=cfg)
             if (not self.args.no_prompt_cache
                     and getattr(self.model, "model_type", None) == "inkling2_loop"):
                 from mlx_lm.models.cache import (
